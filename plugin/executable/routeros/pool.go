@@ -247,6 +247,15 @@ func (p *pool) Learn(ips []netip.Addr, gi uint8) (acts []action, removeIDs []uin
 			if len(p.dyn) >= p.maxDyn {
 				removeIDs = p.evictLocked(removeIDs)
 			}
+			if len(p.dyn) >= p.maxDyn {
+				// Hard cap: eviction found nothing removable (everything is
+				// in flight or hot). Drop this request; it will be retried by
+				// the next query for the same IP.
+				if p.warnEvict.allow() {
+					p.logger.Warn("max_routes reached and nothing evictable; route dropped", zap.Stringer("ip", addr))
+				}
+				break
+			}
 			// New entries start unreferenced: an IP that is learned once and
 			// never resolved again is the first eviction candidate.
 			e = &dynEntry{ip: ip, gw: gi}
@@ -261,8 +270,14 @@ func (p *pool) Learn(ips []netip.Addr, gi uint8) (acts []action, removeIDs []uin
 				}
 			}
 		case e.gw == gi:
-			// same gateway: inflight (someone else is adding) or offline (queued)
+			// Same gateway. Inflight: someone else is adding, nothing to do.
+			// Offline (a previous add/set failed on transport, or learned while
+			// disconnected): retry now if the API is back.
 			e.ref.Store(true)
+			if e.state == stateOffline && p.be.Connected() {
+				e.state = stateInflight
+				acts = append(acts, p.retryAction(e))
+			}
 		case e.state == stateInflight:
 			if p.warnConflict.allow() {
 				p.logger.Warn("gateway conflict while add in flight; ignored",
@@ -274,20 +289,36 @@ func (p *pool) Learn(ips []netip.Addr, gi uint8) (acts []action, removeIDs []uin
 					zap.Stringer("ip", addr), zap.Stringer("existing", p.gwAddr(e.gw)), zap.Stringer("requested", p.gwAddr(gi)),
 					zap.String("policy", map[bool]string{true: "replace", false: "keep"}[p.replace]))
 			}
+			// The kept route is still the one in use: keep it warm for CLOCK.
+			e.ref.Store(true)
 			if p.replace {
 				old, wasSynced := e.gw, e.state == stateSynced
 				e.gw = gi
-				if wasSynced && p.be.Connected() {
+				if !p.be.Connected() {
+					e.state = stateOffline // fixed by the reconnect sync
+				} else if wasSynced {
 					e.state = stateInflight
 					acts = append(acts, action{kind: actSet, e: e, gw: p.gwAddr(gi), oldGw: old, oldSyn: true})
 				} else {
-					e.state = stateOffline // will be fixed by the next sync
+					e.state = stateInflight
+					acts = append(acts, p.retryAction(e))
 				}
 			}
 		}
 		p.mu.Unlock()
 	}
 	return acts, removeIDs
+}
+
+// retryAction builds the API call that brings an offline entry back in sync:
+// an add if the router never gave us an id, otherwise a set on the existing
+// route (a stale id means an earlier set failed on transport; re-adding would
+// create a duplicate route). Caller holds mu and has set e.state=stateInflight.
+func (p *pool) retryAction(e *dynEntry) action {
+	if e.id == 0 {
+		return action{kind: actAdd, e: e, gw: p.gwAddr(e.gw)}
+	}
+	return action{kind: actSet, e: e, gw: p.gwAddr(e.gw), oldGw: e.gw}
 }
 
 // insertLocked places e into dyn and the CLOCK ring. Caller holds mu.
@@ -334,7 +365,7 @@ func (p *pool) evictLocked(removeIDs []uint32) []uint32 {
 		if e.state == stateInflight {
 			continue
 		}
-		if e.state == stateSynced {
+		if e.id != 0 { // synced, or offline with a stale id still on the router
 			removeIDs = append(removeIDs, e.id)
 		}
 		p.removeLocked(e)
@@ -373,12 +404,17 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 			err := p.be.SetGateway(a.e.id, a.gw)
 			p.mu.Lock()
 			if a.e.state == stateInflight && p.dyn[a.e.ip] == a.e {
-				if err == nil {
+				switch {
+				case err == nil:
 					a.e.state = stateSynced
-				} else if isDeviceError(err) {
-					a.e.gw, a.e.state = a.oldGw, stateSynced // router kept the old gateway
-				} else {
-					a.e.state = stateOffline
+				case !isDeviceError(err):
+					a.e.state = stateOffline // transport: retried on next query / sync
+				case a.oldSyn:
+					a.e.gw, a.e.state = a.oldGw, stateSynced // conflict replace rejected; router kept the old gateway
+				default:
+					// retry-set rejected (e.g. route gone from the router): forget
+					// the stale id so the next retry does an add
+					a.e.id, a.e.state = 0, stateOffline
 				}
 			}
 			p.mu.Unlock()
@@ -474,7 +510,9 @@ func (p *pool) Sync(mode syncMode) syncResult {
 		e := p.dyn[ip]
 		switch {
 		case e == nil:
-			if mode == syncAdopt && r.gw.IsValid() && !seenDyn[ip] {
+			// Adopt only when it is a plausible dynamic route: valid IP gateway,
+			// not a duplicate, and not covered by a static CIDR (static wins).
+			if mode == syncAdopt && r.gw.IsValid() && !seenDyn[ip] && !p.staticAny.Contains(r.dst.Addr()) {
 				adoptDyn = append(adoptDyn, r)
 				seenDyn[ip] = true
 			} else {
@@ -619,7 +657,7 @@ func (p *pool) filterOwnedIDs(ids []uint32) []uint32 {
 		}
 	}
 	for _, e := range p.dyn {
-		if e.state == stateSynced {
+		if e.id != 0 {
 			owned[e.id] = true
 		}
 	}
@@ -633,19 +671,21 @@ func (p *pool) filterOwnedIDs(ids []uint32) []uint32 {
 }
 
 // Flush drops every dynamic entry and removes it from the router, then runs a
-// clean sync to catch anything left over.
+// clean sync to catch anything left over. Entries whose add/set is still in
+// flight are kept: their goroutine will settle them and the following sync
+// sees them as regular pool members instead of orphans on the router.
 func (p *pool) Flush() syncResult {
 	p.mu.Lock()
 	ids := make([]uint32, 0, len(p.dyn))
 	for _, e := range p.dyn {
-		if e.state == stateSynced {
+		if e.state == stateInflight {
+			continue
+		}
+		if e.id != 0 {
 			ids = append(ids, e.id)
 		}
+		p.removeLocked(e)
 	}
-	p.dyn = make(map[uint32]*dynEntry)
-	p.clock = p.clock[:0]
-	p.free = p.free[:0]
-	p.hand = 0
 	p.mu.Unlock()
 	if len(ids) > 0 {
 		if err := p.be.RemoveRoutes(ids); err != nil {
@@ -667,7 +707,7 @@ func (p *pool) Close(clean bool) {
 		}
 	}
 	for _, e := range p.dyn {
-		if e.state == stateSynced {
+		if e.id != 0 {
 			ids = append(ids, e.id)
 		}
 	}

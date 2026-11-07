@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
@@ -72,13 +73,29 @@ type RouterOS struct {
 	timeout time.Duration
 	onExit  string
 
+	startMode    syncMode    // on_start policy, used by the first successful sync
+	firstSynced  atomic.Bool // set once the on_start sync + diag have run
+	staticGroups []StaticGroup
+
 	queue   chan func()
 	wg      sync.WaitGroup
-	closeMu sync.Mutex
+	closeMu sync.RWMutex // write-locked by Close; read-locked while enqueueing
 	closed  bool
 
 	warnAAAA rateLimiter
 	warnWait rateLimiter
+}
+
+// onConnected runs after every successful API connection. The first time it
+// applies the on_start policy and the one-off L3HW diagnostics; afterwards the
+// pool is the source of truth and unknown routes are removed.
+func (r *RouterOS) onConnected() {
+	if r.firstSynced.CompareAndSwap(false, true) {
+		r.pool.Sync(r.startMode)
+		go r.startupDiag(r.pool.gwAddr(r.defGw), r.staticGroups)
+		return
+	}
+	r.pool.Sync(syncClean)
 }
 
 var (
@@ -183,23 +200,28 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	}
 	p.finishStatic()
 
+	startMode := syncAdopt
+	if a.OnStart == "clean" {
+		startMode = syncClean
+	}
 	r := &RouterOS{
-		logger:  l,
-		cl:      cl,
-		pool:    p,
-		defGw:   defIdx,
-		wait:    wait,
-		timeout: timeout,
-		onExit:  a.OnExit,
-		queue:   make(chan func(), asyncQueueSize),
+		logger:       l,
+		cl:           cl,
+		pool:         p,
+		defGw:        defIdx,
+		wait:         wait,
+		timeout:      timeout,
+		onExit:       a.OnExit,
+		startMode:    startMode,
+		staticGroups: a.Static,
+		queue:        make(chan func(), asyncQueueSize),
 	}
-	cl.onReconnect = func() {
-		r.pool.Sync(syncClean)
-	}
+	cl.onReconnect = r.onConnected
 
 	// Connect. A login rejection is fatal; a network error only logs and the
 	// client keeps retrying in the background so DNS service is not held
-	// hostage by the switch.
+	// hostage by the switch. The on_start sync runs on whichever connection
+	// succeeds first.
 	if err := cl.Connect(); err != nil {
 		if isDeviceError(err) {
 			return nil, fmt.Errorf("routeros login failed: %w", err)
@@ -211,12 +233,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 			cl.reconnectLoop()
 		}()
 	} else {
-		mode := syncAdopt
-		if a.OnStart == "clean" {
-			mode = syncClean
-		}
-		p.Sync(mode)
-		go r.startupDiag(defGw, a.Static)
+		r.onConnected()
 	}
 
 	if !wait {
@@ -292,12 +309,21 @@ func (r *RouterOS) exec(_ context.Context, qCtx *query_context.Context, gw uint8
 	}
 
 	if !r.wait {
+		// Hold the read lock while enqueueing so Close() cannot close the
+		// channel underneath us (send on closed channel panics).
+		r.closeMu.RLock()
+		if r.closed {
+			r.closeMu.RUnlock()
+			r.pool.dropInflight(acts)
+			return nil
+		}
 		select {
 		case r.queue <- func() { r.pool.Apply(acts, removeIDs) }:
 		default:
 			r.logger.Warn("routeros async queue full; dropping route update", zap.Int("routes", len(acts)))
 			r.pool.dropInflight(acts)
 		}
+		r.closeMu.RUnlock()
 		return nil
 	}
 
@@ -335,11 +361,13 @@ func (r *RouterOS) Close() error {
 		return nil
 	}
 	r.closed = true
+	if !r.wait {
+		close(r.queue) // no sender can be inside the RLock section now
+	}
 	r.closeMu.Unlock()
 
 	if !r.wait {
-		close(r.queue)
-		r.wg.Wait()
+		r.wg.Wait() // drain queued route updates before cleanup
 	}
 	r.pool.Close(r.onExit == "clean")
 	return r.cl.Close()

@@ -55,6 +55,70 @@ func TestParseGateway(t *testing.T) {
 	}
 }
 
+// Review #2: the first successful connection applies on_start (adopt), later
+// ones clean. startupDiag is skipped here because cl is nil.
+func TestOnConnectedFirstTimeAdopts(t *testing.T) {
+	f := newFake()
+	p, _, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	f.inject("1.1.1.1/32", "192.168.88.254")
+	r := &RouterOS{logger: zap.NewNop(), pool: p, startMode: syncAdopt}
+	r.firstSynced.Store(false)
+
+	// simulate: first connect happened late (startup dial failed) -> must adopt
+	r.pool.Sync(r.startMode)
+	r.firstSynced.Store(true)
+	if p.Stats().Dynamic != 1 || f.count() != 1 {
+		t.Fatalf("first sync did not adopt: %+v", p.Stats())
+	}
+	// a later reconnect with an unknown route on the router -> clean
+	f.inject("2.2.2.2/32", "192.168.88.254")
+	r.onConnected()
+	if p.Stats().Dynamic != 1 || f.count() != 1 {
+		t.Fatalf("reconnect sync did not clean: %+v count=%d", p.Stats(), f.count())
+	}
+}
+
+// #7: Exec in async mode must not panic when racing with Close.
+func TestAsyncExecAfterClose(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	r := &RouterOS{logger: zap.NewNop(), pool: p, defGw: a, wait: false, timeout: time.Second, queue: make(chan func(), 4)}
+	r.wg.Add(1)
+	go r.worker()
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	mk := func(ip byte) *query_context.Context {
+		resp := new(dns.Msg)
+		resp.SetReply(q)
+		resp.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET}, A: []byte{1, 1, 1, ip}}}
+		qc := query_context.NewContext(q)
+		qc.SetResponse(resp)
+		return qc
+	}
+	_ = r.Exec(context.Background(), mk(1))
+
+	// Close while another goroutine keeps calling Exec.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 2; i < 60; i++ {
+			_ = r.Exec(context.Background(), mk(byte(i)))
+		}
+	}()
+	r.closeMu.Lock()
+	r.closed = true
+	close(r.queue)
+	r.closeMu.Unlock()
+	r.wg.Wait()
+	<-done
+	if st := p.Stats(); st.Inflight != 0 {
+		t.Fatalf("inflight entries left after close: %+v", st)
+	}
+}
+
 func TestExecExtractsARecords(t *testing.T) {
 	f := newFake()
 	p, a, b := newTestPool(t, f, 100, false)

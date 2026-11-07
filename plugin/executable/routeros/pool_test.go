@@ -426,6 +426,134 @@ func TestConcurrentLearn(t *testing.T) {
 	}
 }
 
+// Review #1: an entry left offline by a transport error must be retried by the
+// next query while the API is up, without waiting for a reconnect sync.
+func TestOfflineRetriedOnNextLearn(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	f.addErr = errors.New("transport")
+	learn(p, a, "1.1.1.1")
+	if p.Stats().Offline != 1 || f.count() != 0 {
+		t.Fatalf("setup: %+v", p.Stats())
+	}
+	f.addErr = nil
+	learn(p, a, "1.1.1.1")
+	if st := p.Stats(); st.Synced != 1 || st.Offline != 0 || f.count() != 1 {
+		t.Fatalf("offline entry not retried: %+v router=%d", st, f.count())
+	}
+}
+
+// Review #1b: an entry that is offline but still holds a router id (a set
+// failed on transport) must be repaired with set, never re-added.
+func TestOfflineWithStaleIDUsesSet(t *testing.T) {
+	f := newFake()
+	p, a, b := newTestPool(t, f, 100, true)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1") // synced via A
+	f.mu.Lock()
+	f.connected = false
+	f.mu.Unlock()
+	// replace while disconnected -> offline with stale id, gw now B
+	learn(p, b, "1.1.1.1")
+	if st := p.Stats(); st.Offline != 1 {
+		t.Fatalf("expected offline: %+v", st)
+	}
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
+	learn(p, b, "1.1.1.1")
+	if f.adds != 1 || f.sets != 1 || f.count() != 1 {
+		t.Fatalf("expected one set, no duplicate add: adds=%d sets=%d count=%d", f.adds, f.sets, f.count())
+	}
+	if r, _ := f.find("1.1.1.1/32"); r.gw != gwB {
+		t.Fatalf("gw=%v", r.gw)
+	}
+}
+
+// Review #3: max_routes is a hard cap even when nothing is evictable.
+func TestMaxRoutesHardCap(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 3, false)
+	p.finishStatic()
+	// fill with inflight entries (never applied) so eviction cannot free anything
+	for _, ip := range []string{"1.1.1.1", "1.1.1.2", "1.1.1.3"} {
+		p.Learn([]netip.Addr{netip.MustParseAddr(ip)}, a)
+	}
+	acts, _ := p.Learn([]netip.Addr{netip.MustParseAddr("1.1.1.4")}, a)
+	if len(acts) != 0 || p.Stats().Dynamic != 3 {
+		t.Fatalf("cap exceeded: acts=%d dyn=%d", len(acts), p.Stats().Dynamic)
+	}
+}
+
+// Review #4: a keep-conflict hit still marks the kept route as recently used.
+func TestKeepConflictKeepsRouteWarm(t *testing.T) {
+	f := newFake()
+	p, a, b := newTestPool(t, f, 4, false)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4")
+	learn(p, b, "1.1.1.1") // conflict on .1 via other gateway -> must set ref
+	learn(p, a, "2.2.2.2") // forces eviction of one cold entry
+	if _, ok := f.find("1.1.1.1/32"); !ok {
+		t.Fatal("kept route was evicted although it was just referenced")
+	}
+}
+
+// #8: flush must not orphan routes whose add is still in flight.
+func TestFlushKeepsInflight(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1")
+	acts, _ := p.Learn([]netip.Addr{netip.MustParseAddr("2.2.2.2")}, a) // inflight, not applied yet
+	p.Flush()
+	p.Apply(acts, nil) // the late add completes
+	if st := p.Stats(); st.Dynamic != 1 || st.Synced != 1 {
+		t.Fatalf("inflight entry lost: %+v", st)
+	}
+	if f.count() != 1 {
+		t.Fatalf("router has %d routes, want 1", f.count())
+	}
+	if _, ok := f.find("2.2.2.2/32"); !ok {
+		t.Fatal("inflight route missing")
+	}
+}
+
+// #10: residual /32 covered by a static CIDR is removed, not adopted.
+func TestAdoptSkipsStaticCovered(t *testing.T) {
+	f := newFake()
+	p, _, _ := newTestPool(t, f, 100, false)
+	_ = p.addStatic(netip.MustParsePrefix("10.0.0.0/8"), gwA)
+	p.finishStatic()
+	f.inject("10.0.0.0/8", "192.168.88.254")
+	f.inject("10.1.1.1/32", "192.168.88.253") // conflicts with static
+	f.inject("1.1.1.1/32", "192.168.88.254")  // genuine leftover
+	res := p.Sync(syncAdopt)
+	if res.Removed != 1 || p.Stats().Dynamic != 1 || f.count() != 2 {
+		t.Fatalf("res=%+v stats=%+v count=%d", res, p.Stats(), f.count())
+	}
+}
+
+// #11: eviction and close must remove routes of offline entries that still
+// hold a router id.
+func TestCloseRemovesStaleIDs(t *testing.T) {
+	f := newFake()
+	p, a, b := newTestPool(t, f, 100, true)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1")
+	f.mu.Lock()
+	f.connected = false
+	f.mu.Unlock()
+	learn(p, b, "1.1.1.1") // offline with stale id
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
+	p.Close(true)
+	if f.count() != 0 {
+		t.Fatalf("stale-id route left on router: %d", f.count())
+	}
+}
+
 func TestIDHelpers(t *testing.T) {
 	for _, s := range []string{"*1", "*1A3F", "*FFFFFFFF"} {
 		id, err := parseID(s)

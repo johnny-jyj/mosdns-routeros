@@ -108,6 +108,12 @@ func (cl *client) Connect() error {
 	errC := c.Async()
 
 	cl.mu.Lock()
+	if cl.closed.Load() {
+		// Close() raced with this connect: do not keep the new connection.
+		cl.mu.Unlock()
+		_ = c.Close()
+		return errNotConnected
+	}
 	cl.c = c
 	cl.gen++
 	gen := cl.gen
@@ -153,6 +159,9 @@ func (cl *client) reconnectLoop() {
 		case <-cl.closeCh:
 			return
 		case <-time.After(backoff):
+		}
+		if cl.closed.Load() {
+			return
 		}
 		if err := cl.Connect(); err != nil {
 			cl.logger.Warn("routeros reconnect failed", zap.Error(err), zap.Duration("retry_in", backoff*2))
