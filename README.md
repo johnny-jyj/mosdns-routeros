@@ -108,9 +108,28 @@ $ros 执行 ──① API add，RouterOS 提交配置──▶ 路由出现在 /
 | ① API `add` 往返，单连接顺序 | min 21 ms，p50 22 ms，max 24 ms（n=20） |
 | ① 并发 `add` | RouterOS **串行提交**：1 路 37 条/s，4 路 50/s，16 路 55/s；并发只拉长单条延迟（16 路 p50 293 ms） |
 | ② `/32` 从 `add` 返回到出现在硬件 `ipv4-hosts` | min 26 ms，p50 31 ms，max 43 ms（n=20）；走 host 表，`route-index-delay-min` 设 1s 或 0s 结果相同 |
-| ② 前缀路由（static CIDR）从 `add` 返回到硬件 | `route-index-delay-min=1s`（默认）：min 1.02 s，p50 1.03 s，max 1.11 s（n=8）；设 `0s`：min 26 ms，p50 28 ms，max 36 ms（n=8） |
+| ② 前缀路由（static CIDR）从 `add` 返回到硬件 | `route-index-delay-min=1s`（默认）：p50 1.03 s；`0s`：p50 30 ms（与 `/32` 相同）。完整参数矩阵见下 |
 | `remove` 200 条 | 一条命令带 200 个 `.id`：4.6 s；路由器侧脚本 `remove [find comment=…]`：5.4 s。约 23 ms/条，没有更快的办法 |
 | 重复添加同一 `dst-address` | RouterOS **静默接受**，不报错；去重完全由插件的路由池负责，启动对账会删除路由器上的重复项 |
+
+### `l3hw-settings/advanced` 参数对延迟的影响（每组 n=6，分辨率 5 ms，测后复原）
+
+| 配置 | `/24` add→硬件 p50 | `/32` add→硬件 p50 | API `add` 往返 |
+|---|---|---|---|
+| 默认（min 1s / max 10s / queue-high 256） | **1.03 s** | 35 ms | 21–26 ms |
+| `route-index-delay-min=0s` | 30 ms | 30 ms | 不变 |
+| 只设 `route-index-delay-max=0s` | 32 ms（RouterOS 会把 min 一并压到 0） | 35 ms | 不变 |
+| min=0 max=0 | 34 ms | 37 ms | 不变 |
+| 以上 + `route-queue-limit-high=0` | 28 ms | 27 ms | 不变 |
+| 以上 + `route-queue-limit-high=1` | 33 ms | 29 ms | 不变 |
+| 以上 + `shwp-reset-counter=0 partial-offload-chunk=16` | 28 ms | 29 ms | 不变 |
+
+- `/32` 动态路由在任何配置下都是 25–40 ms，这些参数对它们没有影响。
+- 前缀路由只需 `route-index-delay-min=0s` 一项即可从 1 s 降到 30 ms；`max` 单独设 0 等价于把 min 也设 0，min 为 0 后 max 不再有作用。
+- `route-queue-limit-*`、`shwp-reset-counter`、`partial-offload-chunk` 管的是大表批处理与部分卸载，对单条延迟无可测影响；`neigh-*` 管 ARP 邻居保活，与路由写入无关。
+- **没有任何参数能缩短 API `add` 往返（约 21 ms）**，这是 RouterOS 配置提交的固定成本，也是 `wait: true` 所等待的部分。
+
+说明：p50 / p90 为百分位（中位数 / 90% 样本以内），不是条数。
 
 一条 `/32` 从 `$ros` 执行到硬件转发合计约 50 ms；`wait: true` 时客户端在约 22 ms 后拿到 DNS 应答，此时路由已在 RouterOS 中（CPU 转发），再过约 30 ms 进硬件。
 
