@@ -20,17 +20,24 @@ func (r *RouterOS) startupDiag(defGw netip.Addr, static []StaticGroup) {
 	if err != nil {
 		l.Warn("switch print failed", zap.Error(err))
 	}
+	// Devices may have several switch chips (e.g. CRS504: the 98DX4310 data
+	// plane plus a small Atheros chip for the management port). Only warn when
+	// no chip at all has offloading on; the per-gateway check below tells
+	// whether the chip that matters is enabled.
+	anyOn := false
 	for _, s := range sw {
 		v := s.Map["l3-hw-offloading"]
-		fields := []zap.Field{zap.String("switch", s.Map["name"]), zap.String("l3-hw-offloading", v)}
+		fields := []zap.Field{zap.String("switch", s.Map["name"]), zap.String("type", s.Map["type"]), zap.String("l3-hw-offloading", v)}
 		if e := s.Map["l3hw-error"]; e != "" {
 			fields = append(fields, zap.String("l3hw-error", e))
 		}
 		if isTrue(v) {
-			l.Info("switch L3HW enabled", fields...)
-		} else {
-			l.Warn("switch L3HW is NOT enabled; routes will be forwarded by CPU", fields...)
+			anyOn = true
 		}
+		l.Info("switch chip", fields...)
+	}
+	if len(sw) > 0 && !anyOn {
+		l.Warn("no switch chip has l3-hw-offloading=yes; all routes will be forwarded by CPU")
 	}
 
 	// 2. gateway reachability / interface offloading

@@ -91,8 +91,25 @@ L3HW 要点：
 
 - `/ip/route print` 的 `H` 标志只表示该路由**可以**被卸载；实际卸载情况看 `/interface/ethernet/switch/l3hw-settings/monitor`：`ipv4-hosts` 是硬件里的 `/32` 条目数（本插件的动态路由落在这里），`ipv4-shortest-hw-prefix` 非 0 表示硬件表满、短前缀走 CPU，`route-queue-size` 应恒为 0。
 - gateway 必须是连通网段内的 IPv4 地址（不能是接口名），且该接口 / VLAN / bridge 成员端口的 `l3-hw-offloading` 为 yes。启动体检会按 `/ip/address` 找到每个 gateway 所在接口并检查，异常时打 warning。
-- 新路由写入 RouterOS 后由驱动按 `route-index-delay-min`（默认 1s）/ `route-index-delay-max`（默认 10s）批量下硬件，期间由 CPU 转发，不影响连通性。如需更快进硬件可在 `/interface/ethernet/switch/l3hw-settings/advanced` 调小（调优实验结果见下文，待补充）。
 - 驱动出错时 RouterOS 会自动关闭 `l3-hw-offloading` 并显示错误码；建议 `l3hw-settings set autorestart=yes`。
+- 管理口（CRS504 的 `ether1`）挂在独立的小交换芯片上、不参与 L3HW，gateway 不要放在管理网段。
+
+## 实测数据（CRS504-4XQ，RouterOS 7.23.8，直连管理口）
+
+| 项目 | 结果 |
+|---|---|
+| API `add` 往返（单连接顺序） | p50 23 ms，p99 42 ms（ping 0.4 ms，耗时在 RouterOS 配置提交） |
+| 并发 `add` 吞吐 | 1 路 37/s，4 路 50/s，16 路 55/s；RouterOS 串行提交，并发只会拉长单条延迟（16 路 p50 293 ms） |
+| `/32` 动态路由进硬件 | add 返回后约 60 ms 全部出现在 `ipv4-hosts`（host 表，不经过 `route-index-delay`） |
+| 前缀路由（static CIDR）进硬件 | `route-index-delay-min=1s`（默认）时 1.12 s；设为 `0s` 时 60 ms |
+| 批量 `remove`（100 条一命令） | 2.1 s，同样受 RouterOS 串行提交限制 |
+| 重复添加同一 `dst-address` | RouterOS **静默接受**，不报错；因此去重完全由插件的路由池负责，启动对账会删除路由器上的重复项 |
+
+由此得到的默认值与建议：
+
+- `wait: true`：每次 cache miss 多等约 25 ms（突发时更长），换来客户端拿到 IP 时路由已在。若更在意 DNS 延迟且能接受首个连接走默认路由，改 `wait: false`。
+- 动态路由全是 `/32`，`route-index-delay-*` 对它们无影响；仅当 `static` 里有很多 CIDR 且希望启动后立刻进硬件时，才考虑 `/interface/ethernet/switch/l3hw-settings/advanced set route-index-delay-min=0s`。
+- RouterOS 的 `/ip/service set api disabled=yes` 不会断开已建立的 API 会话；插件靠 TCP 层错误感知断线，实测断线后 1 s 起指数退避重连，期间学到的 IP 标记 offline，重连后由对账统一补加。
 
 ## 构建
 
