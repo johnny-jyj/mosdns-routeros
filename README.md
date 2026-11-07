@@ -100,8 +100,8 @@ L3HW 要点：
 |---|---|
 | API `add` 往返（单连接顺序） | p50 23 ms，p99 42 ms（ping 0.4 ms，耗时在 RouterOS 配置提交） |
 | 并发 `add` 吞吐 | 1 路 37/s，4 路 50/s，16 路 55/s；RouterOS 串行提交，并发只会拉长单条延迟（16 路 p50 293 ms） |
-| `/32` 动态路由进硬件 | add 返回后约 60 ms 全部出现在 `ipv4-hosts`（host 表，不经过 `route-index-delay`） |
-| 前缀路由（static CIDR）进硬件 | `route-index-delay-min=1s`（默认）时 1.12 s；设为 `0s` 时 60 ms |
+| `/32` 动态路由进硬件 | API `add` 返回后约 30 ms（中位 29 ms，最小 26 ms，轮询分辨率 5 ms）出现在 `ipv4-hosts`；若从路由进入 RIB 起算会更短。走 host 表，不经过 `route-index-delay` |
+| 前缀路由（static CIDR）进硬件 | `route-index-delay-min=1s`（默认）时 1.12 s；设为 `0s` 时约 60 ms（50 ms 轮询粒度，实际可能更短） |
 | 批量 `remove`（100 条一命令） | 2.1 s，同样受 RouterOS 串行提交限制 |
 | 重复添加同一 `dst-address` | RouterOS **静默接受**，不报错；因此去重完全由插件的路由池负责，启动对账会删除路由器上的重复项 |
 
