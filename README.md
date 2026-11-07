@@ -94,20 +94,45 @@ L3HW 要点：
 - 驱动出错时 RouterOS 会自动关闭 `l3-hw-offloading` 并显示错误码；建议 `l3hw-settings set autorestart=yes`。
 - 管理口（CRS504 的 `ether1`）挂在独立的小交换芯片上、不参与 L3HW，gateway 不要放在管理网段。
 
-## 实测数据（CRS504-4XQ，RouterOS 7.23.8，直连管理口）
+## 实测数据（CRS504-4XQ，RouterOS 7.23.8，直连管理口，ping 0.4 ms）
 
-| 项目 | 结果 |
+一条动态路由从 DNS 应答到硬件转发要经过三个阶段，`wait` 只影响其中一个：
+
+```
+$ros 执行 ──① API add，RouterOS 提交配置──▶ 路由出现在 /ip/route（CPU 可转发）──② 驱动写入交换芯片──▶ 硬件转发
+            wait=true 时 DNS 应答等这一步                 任何模式都不等，RouterOS 内部异步
+```
+
+| 阶段 | 结果（轮询分辨率 5 ms） |
 |---|---|
-| API `add` 往返（单连接顺序） | p50 23 ms，p99 42 ms（ping 0.4 ms，耗时在 RouterOS 配置提交） |
-| 并发 `add` 吞吐 | 1 路 37/s，4 路 50/s，16 路 55/s；RouterOS 串行提交，并发只会拉长单条延迟（16 路 p50 293 ms） |
-| `/32` 动态路由进硬件 | API `add` 返回后约 30 ms（中位 29 ms，最小 26 ms，轮询分辨率 5 ms）出现在 `ipv4-hosts`；若从路由进入 RIB 起算会更短。走 host 表，不经过 `route-index-delay` |
-| 前缀路由（static CIDR）进硬件 | `route-index-delay-min=1s`（默认）时 1.12 s；设为 `0s` 时约 60 ms（50 ms 轮询粒度，实际可能更短） |
-| 批量 `remove`（100 条一命令） | 2.1 s，同样受 RouterOS 串行提交限制 |
-| 重复添加同一 `dst-address` | RouterOS **静默接受**，不报错；因此去重完全由插件的路由池负责，启动对账会删除路由器上的重复项 |
+| ① API `add` 往返，单连接顺序 | min 21 ms，p50 22 ms，max 24 ms（n=20） |
+| ① 并发 `add` | RouterOS **串行提交**：1 路 37 条/s，4 路 50/s，16 路 55/s；并发只拉长单条延迟（16 路 p50 293 ms） |
+| ② `/32` 从 `add` 返回到出现在硬件 `ipv4-hosts` | min 26 ms，p50 31 ms，max 43 ms（n=20）；走 host 表，`route-index-delay-min` 设 1s 或 0s 结果相同 |
+| ② 前缀路由（static CIDR）从 `add` 返回到硬件 | `route-index-delay-min=1s`（默认）：min 1.02 s，p50 1.03 s，max 1.11 s（n=8）；设 `0s`：min 26 ms，p50 28 ms，max 36 ms（n=8） |
+| `remove` 200 条 | 一条命令带 200 个 `.id`：4.6 s；路由器侧脚本 `remove [find comment=…]`：5.4 s。约 23 ms/条，没有更快的办法 |
+| 重复添加同一 `dst-address` | RouterOS **静默接受**，不报错；去重完全由插件的路由池负责，启动对账会删除路由器上的重复项 |
 
-由此得到的默认值与建议：
+一条 `/32` 从 `$ros` 执行到硬件转发合计约 50 ms；`wait: true` 时客户端在约 22 ms 后拿到 DNS 应答，此时路由已在 RouterOS 中（CPU 转发），再过约 30 ms 进硬件。
 
-- `wait: true`：每次 cache miss 多等约 25 ms（突发时更长），换来客户端拿到 IP 时路由已在。若更在意 DNS 延迟且能接受首个连接走默认路由，改 `wait: false`。
+### `wait` 对 DNS 延迟的影响（mosdns 实例实测，`hosts` 插件返回固定 IP，上游耗时为 0）
+
+| 场景 | `wait: true` | `wait: false` |
+|---|---|---|
+| 新 IP，顺序查询 ×20 | p50 35 ms，max 43 ms | 0 ms |
+| 同 20 个再查一次（池命中，不调 API） | 0 ms | 0 ms |
+| 新 IP，20 条并发（模拟打开一个网页） | min 151 ms，p50 278 ms，**max 346 ms** | 0 ms |
+| 新 IP，60 条并发 | min 366 ms，p50 807 ms，**max 966 ms** | 1 ms |
+
+并发时延迟**串行叠加**：RouterOS 每秒只提交约 55 条，第 k 条应答要等前 k−1 条提交完，所以 20 条并发的最后一条等了 346 ms。只有**首次出现、且未命中 cache 的 IP** 才会进入这条路径；池命中（同一 IP 再次解析）和 cache 命中都是 0 ms。
+
+真实页面（`www.cloudflare.com` 等 10 个域名并发，上游 223.5.5.5 本身约 300 ms）：`wait: true` 首次 p50 620 ms / max 844 ms，`wait: false` 首次 p50 296 ms / max 967 ms（max 来自上游 CNAME 链，与插件无关）。第二次两者都约 300 ms。
+
+是否可感知：首次打开一个全新站点时，`wait: true` 让各域名的 DNS 应答多等 20–350 ms（取决于同时有多少新 IP），之后不再有；浏览器通常并行请求，整体多花的时间约等于最后一条的等待（几百毫秒），一般可感知但不明显。`wait: false` 则 DNS 零延迟，但第一个连接的首包在路由就位前（约 25–50 ms）会按默认路由走，若默认路由和目标 gateway 不是同一个出口，这条连接可能在中途换路径。
+
+建议：
+
+- 默认 `wait: true`，分流正确性优先。若更在意首次打开速度且能接受首个连接走默认路由，改 `wait: false`。
+- 退出清理耗时 ≈ 23 ms × 路由数（1000 条约 23 s，10000 条约 4 min）。用 systemd 管理时相应调大 `TimeoutStopSec`；池很大时考虑 `on_exit: keep` + `on_start: adopt`（接管不调 API，瞬间完成）。
 - 动态路由全是 `/32`，`route-index-delay-*` 对它们无影响；仅当 `static` 里有很多 CIDR 且希望启动后立刻进硬件时，才考虑 `/interface/ethernet/switch/l3hw-settings/advanced set route-index-delay-min=0s`。
 - RouterOS 的 `/ip/service set api disabled=yes` 不会断开已建立的 API 会话；插件靠 TCP 层错误感知断线，实测断线后 1 s 起指数退避重连，期间学到的 IP 标记 offline，重连后由对账统一补加。
 
