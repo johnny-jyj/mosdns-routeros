@@ -471,6 +471,32 @@ func TestOfflineWithStaleIDUsesSet(t *testing.T) {
 	}
 }
 
+// A retry-set on a route that was deleted behind our back must re-add it in
+// the same Apply, so the query that triggered it ends with a route in place.
+func TestRetrySetOnDeletedRouteReadds(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1")
+	r, _ := f.find("1.1.1.1/32")
+	// leave the entry offline with a stale id, then delete the route on the router
+	f.mu.Lock()
+	f.connected = false
+	f.mu.Unlock()
+	p.mu.Lock()
+	p.dyn[0x01010101].state = stateOffline
+	p.mu.Unlock()
+	f.mu.Lock()
+	delete(f.routes, r.id)
+	f.connected = true
+	f.mu.Unlock()
+
+	learn(p, a, "1.1.1.1") // retry -> set fails (no such item) -> immediate add
+	if st := p.Stats(); st.Synced != 1 || f.count() != 1 || f.adds != 2 {
+		t.Fatalf("stats=%+v count=%d adds=%d", st, f.count(), f.adds)
+	}
+}
+
 // Review #3: max_routes is a hard cap even when nothing is evictable.
 func TestMaxRoutesHardCap(t *testing.T) {
 	f := newFake()

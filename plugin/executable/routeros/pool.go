@@ -402,6 +402,7 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 			}
 		case actSet:
 			err := p.be.SetGateway(a.e.id, a.gw)
+			readd := false
 			p.mu.Lock()
 			if a.e.state == stateInflight && p.dyn[a.e.ip] == a.e {
 				switch {
@@ -412,14 +413,19 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 				case a.oldSyn:
 					a.e.gw, a.e.state = a.oldGw, stateSynced // conflict replace rejected; router kept the old gateway
 				default:
-					// retry-set rejected (e.g. route gone from the router): forget
-					// the stale id so the next retry does an add
-					a.e.id, a.e.state = 0, stateOffline
+					// Retry-set rejected: the route is gone from the router (e.g.
+					// deleted by hand). Forget the stale id and re-add right now
+					// so this query does not leave the IP without a route.
+					a.e.id = 0
+					readd = true
 				}
 			}
 			p.mu.Unlock()
 			if err != nil {
 				p.logger.Warn("set gateway failed", zap.Stringer("ip", ipFromU32(a.e.ip)), zap.Stringer("gateway", a.gw), zap.Error(err))
+			}
+			if readd {
+				p.Apply([]action{{kind: actAdd, e: a.e, gw: a.gw}}, nil)
 			}
 		}
 	}
