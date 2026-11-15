@@ -1,0 +1,38 @@
+schema_version: 1
+project: mosdns-routeros
+repository: ../../..
+plan: ../../../../mosdns_routeros_plugin_c0119527.plan
+
+review:
+  range_expression: f946944de231cc27ad027f0d80221ab73b30fc4d^..83e43c7b0a5bf6e32fd204e8f2576a692c98e5c7
+  base_exclusive: 9cfb7ce985599c087cb7ccfb1531d0c0f4021242
+  first_inclusive: f946944de231cc27ad027f0d80221ab73b30fc4d
+  reviewed_head: 83e43c7b0a5bf6e32fd204e8f2576a692c98e5c7
+  excluded_paths:
+    - third_party/**
+  focus: plugin/executable/routeros
+
+resolution:
+  status: closed
+  fix_commit: 3288348df5a4918eaf6f4ec2ab431759f975fc56
+  implementation_diff_sha256: 6bd2b8f46b402567b4cb5c39f7afcf7fe65b7b84f01a2c34f2a86d9a6d07a025
+  findings: 7
+  fixed_findings: 7
+  unresolved_findings: 0
+
+verification:
+  go_test_race_all: passed
+  go_vet_all: passed
+  deterministic_concurrency_repetitions: 50
+  fast_hit_baseline_ns_per_op: 5.088-5.111
+  fast_hit_final_ns_per_op: 5.087-5.129
+  fast_hit_allocs_per_op: 0
+  routeros_e2e_wait_true: passed
+  routeros_e2e_wait_false: passed
+  routeros_management_source: 192.168.88.100
+  routeros_test_destination: 198.51.100.200/32
+  routeros_test_routes_after_cleanup: 0
+  protected_destination: 144.34.229.181
+  protected_route_before_during_after: 0.0.0.0/0 via 192.168.5.1%vlan5
+
+archived_at: 2026-11-16T03:19:00+08:00
