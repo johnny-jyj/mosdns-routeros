@@ -9,15 +9,18 @@ PR #32 fixes:
 - registering async reply tags after sending, which can drop fast replies;
 - cancelling the shared reader when one `RunArgsContext` is cancelled.
 
-The local follow-up in `run.go` and `listen.go` registers tags before taking
-the writer sentence lock, but never holds the client mutex while waiting for
-or flushing the writer. This both prevents fast-reply loss and lets `Close`
-abort a write blocked by an unresponsive peer. `client.go` likewise publishes
-the closing state under the mutex, then closes I/O without holding it.
+The local follow-up in `run.go` registers an async command's tag before taking
+the writer sentence lock. PR #32 takes the writer lock first, then returns
+without `EndSentence` if the async loop has ended, permanently leaking that
+lock. The RouterOS plugin uses this `RunArgsContext` path.
 
 `proto/io_context.go` also uses `sync.Once` to close its cancellation channel.
 The upstream non-blocking send can be lost before a read starts, while racing
 `Cancel` with `Close` can send on a channel as it is being closed.
+
+No other production source differs from PR #32. In particular, the plugin does
+not use the `Listen*` API, so that path is kept exactly at PR #32 rather than
+carrying unrelated local lock changes.
 
 ## Mandatory upgrade checklist
 

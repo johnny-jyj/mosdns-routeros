@@ -80,27 +80,29 @@ func (c *Client) ListenArgsQueueContext(ctx context.Context, sentence []string, 
 	l.tag = fmt.Sprintf("l%d", tag)
 	l.reC = make(chan *proto.Sentence, queueSize)
 
-	c.mu.Lock()
-	if c.tags == nil {
-		c.mu.Unlock()
-		return nil, errAsyncLoopEnded
-	}
-
 	c.w.BeginSentence()
+
 	c.logger().Debug("set listener tag", slog.String("tag", l.tag))
+
 	for _, word := range sentence {
 		c.w.WriteWord(word)
 	}
 	c.w.WriteWord(".tag=" + l.tag)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Register the tag BEFORE the sentence is sent, so a fast first reply
+	// cannot reach asyncLoop while the tag does not exist yet and be
+	// dropped (same race as RunArgsContext, see run.go).
+	if c.tags == nil {
+		return nil, errAsyncLoopEnded
+	}
+
 	c.tags[l.tag] = l
-	c.mu.Unlock()
 
 	if err := c.w.EndSentence(); err != nil {
-		c.mu.Lock()
-		if c.tags != nil {
-			delete(c.tags, l.tag)
-		}
-		c.mu.Unlock()
+		delete(c.tags, l.tag)
 
 		return nil, err
 	}
