@@ -12,10 +12,13 @@ review:
 
 resolution:
   status: closed
-  fixed_head: efedd59a7992d7af4a3f151ff83cf374571367f9
+  initial_fixed_head: efedd59a7992d7af4a3f151ff83cf374571367f9
+  current_verified_head: e0d58ec6ccbacde763942b45f5e98a4e44771d91
+  dependency_minimization_commit: e0d58ec6ccbacde763942b45f5e98a4e44771d91
   commits:
     - 624eb2f712e6100b406caa79e08781f39beb8e39
     - efedd59a7992d7af4a3f151ff83cf374571367f9
+    - e0d58ec6ccbacde763942b45f5e98a4e44771d91
   original_findings: 12
   follow_up_findings: 3
   unresolved_findings: 0
@@ -26,6 +29,9 @@ dependency_override:
   temporary: true
   require_version_is_build_source: false
   patch_manifest: third_party/go-routeros/PATCHES.md
+  production_files_changed_after_pr32:
+    - run.go
+    - proto/io_context.go
   upgrade_check_required: true
   preferred_exit: remotely pinned fork pseudo-version or fully fixed upstream
 
@@ -37,6 +43,8 @@ verification:
   fast_hit_ns_per_op: 5.10-5.30
   fast_hit_allocs_per_op: 0
   routeros_e2e: passed
+  routeros_concurrent_routes: 64
+  routeros_concurrent_add_remove: passed
   routeros_device: CRS504-4XQ
   routeros_management_source: 192.168.88.100
   protected_destination: 144.34.229.181

@@ -6,10 +6,12 @@
 - 范围基点（exclusive）：`9cfb7ce985599c087cb7ccfb1531d0c0f4021242`
 - 首个被审查提交：`f946944de231cc27ad027f0d80221ab73b30fc4d`
 - 被审查 HEAD：`4dfa312f7e20759baa65a711e51c4077e3467726`
-- 最终修复 HEAD：`efedd59a7992d7af4a3f151ff83cf374571367f9`
+- 初始修复 HEAD：`efedd59a7992d7af4a3f151ff83cf374571367f9`
+- 当前验证代码 HEAD：`e0d58ec6ccbacde763942b45f5e98a4e44771d91`
 - 修复提交：
   - `624eb2f712e6100b406caa79e08781f39beb8e39` — `routeros: harden async lifecycle and reconciliation`
   - `efedd59a7992d7af4a3f151ff83cf374571367f9` — `routeros: close remaining timeout races`
+  - `e0d58ec6ccbacde763942b45f5e98a4e44771d91` — `routeros: minimize local go-routeros patches`
 - 实现依据：`mosdns_routeros_plugin_c0119527.plan`
 - 重点目录：`plugin/executable/routeros/`
 - 状态：**已关闭；15 个有效问题全部修复，0 个已知未关闭项**
@@ -35,7 +37,9 @@
 
 根 `go.mod` 中的 `replace github.com/go-routeros/routeros/v3 => ./third_party/go-routeros` 是**临时本地覆盖**。实际构建使用 `third_party/go-routeros`，而不是 `require` 行中的版本；因此只修改 require 或运行常规依赖升级不会同步 go-routeros 上游。
 
-保留本地副本的原因是：上游 v3.0.1 尚无 Async 修复，未合并的 PR #32 也没有包含本次故障注入发现的 writer/client 锁序、Close 解阻塞和 Cancel/Close 竞态修复。Go pseudo-version 只能引用远程仓库中已存在的 commit，不能引用这些仅存在于本项目的补丁。
+保留本地副本的原因是：上游 v3.0.1 尚无 Async 修复；未合并的 PR #32 仍可能在 Async 已结束时返回而不释放 writer sentence 锁，也没有解决插件并发 Cancel/Close 时的取消丢失和关闭竞态。Go pseudo-version 只能引用远程仓库中已存在的 commit，不能引用这些仅存在于本项目的补丁。
+
+本地生产代码相对 PR #32 只保留两个、且均由当前插件使用的差异：`run.go` 的 writer 锁生命周期修复，以及 `proto/io_context.go` 的 Cancel/Close 一次性关闭修复。`client.go` 和插件未使用的 `Listen*` 路径保持 PR #32 原样；没有修改协议编码、登录、RouterOS sentence、路由命令或响应解析。
 
 以后每次检查或升级 go-routeros 都必须：
 
@@ -125,10 +129,10 @@
 
 ## 后置并发复核
 
-### 13. [高] deadline 不覆盖发送阶段，Close 存在锁序阻塞
+### 13. [高] deadline 不覆盖发送阶段，Async 结束可泄漏 writer 锁
 
-- 原因：`RunArgsContext` 在 sentence 发送完成后才等待 context；对端不读时 Flush 可永久阻塞。go-routeros 同时持有 client mutex 等待 writer，使 Close 无法自救。
-- 方法：generation watchdog 在 deadline 主动关闭连接；tag 在拿 writer 前注册，但不持有 client mutex 等待或刷新 writer；Close 在发布 closing 后无锁关闭 I/O。
+- 原因：`RunArgsContext` 在 sentence 发送完成后才等待 context；对端不读时 Flush 可永久阻塞。PR #32 还会先取得 writer sentence 锁，再检查 Async tags；若 Async 已结束，它直接返回而不调用 `EndSentence`，锁将永久遗留。
+- 方法：generation watchdog 在 deadline 主动关闭连接；`run.go` 在取得 writer 锁前检查并注册 tag，且不持有 client mutex 等待或刷新 writer。`Client.Close` 保持 PR #32 原实现。
 - 结果：对端完全不读且两个命令竞争 writer 时，命令和 Close 均按期返回；race 重复测试通过。
 
 ### 14. [中] replace-set stale id 永久伪 synced
@@ -165,6 +169,7 @@
 - comment 查询准确返回 100 条；测试结束后剩余 0 条。
 - RouterOS 接受重复 `dst-address`，不会返回 trap；插件连续解析同一 A 记录两次后仅保留 1 条路由，证明池内去重有效。
 - 完整 mosdns DNS→RouterOS E2E：`routeros-e2e.test` 返回 `198.51.100.200`，路由写入并硬件卸载；`SIGTERM` 后 clean 删除成功。
+- 同一 Async 连接在 Go race 检测下并发 add 64 条、remove 64 条保留网段 `/32`：add 总计 `1.09 s`、remove 总计 `0.85 s`；全部路由 active 且 hw-offloaded，结束后测试 comment 剩余 0 条。
 - `144.34.229.181` 保护检查：测试前后主表 LPM 唯一命中均为 `0.0.0.0/0 via 192.168.5.1%vlan5`，未创建、修改或删除该目的地址路由。
 
 ## 说明
