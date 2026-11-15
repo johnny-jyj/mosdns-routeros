@@ -8,11 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
@@ -45,7 +46,7 @@ type Args struct {
 	Password           string `yaml:"password"`
 	TLS                bool   `yaml:"tls"`
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
-	Timeout            string `yaml:"timeout"` // duration, default 2s
+	Timeout            string `yaml:"timeout"` // dial/login/add/set duration, default 2s
 
 	// route attributes
 	Gateway      string `yaml:"gateway"`
@@ -73,14 +74,19 @@ type RouterOS struct {
 	timeout time.Duration
 	onExit  string
 
-	startMode    syncMode    // on_start policy, used by the first successful sync
-	firstSynced  atomic.Bool // set once the on_start sync + diag have run
+	startMode    syncMode // on_start policy, used by the first successful sync
+	firstSyncMu  sync.Mutex
+	firstSynced  bool // set after the on_start list/reconciliation has run
 	staticGroups []StaticGroup
 
-	queue   chan func()
-	wg      sync.WaitGroup
-	closeMu sync.RWMutex // write-locked by Close; read-locked while enqueueing
-	closed  bool
+	queue      chan func()
+	queueSlots chan struct{}
+	workerWG   sync.WaitGroup
+	opsWG      sync.WaitGroup
+	lifeMu     sync.RWMutex // guards paused/closed and opsWG.Add versus Wait
+	controlMu  sync.Mutex   // serialises Flush and Close
+	paused     bool
+	closed     bool
 
 	warnAAAA rateLimiter
 	warnWait rateLimiter
@@ -90,19 +96,99 @@ type RouterOS struct {
 // applies the on_start policy and the one-off L3HW diagnostics; afterwards the
 // pool is the source of truth and unknown routes are removed.
 func (r *RouterOS) onConnected() {
-	if r.firstSynced.CompareAndSwap(false, true) {
-		r.pool.Sync(r.startMode)
-		go r.startupDiag(r.pool.gwAddr(r.defGw), r.staticGroups)
+	r.firstSyncMu.Lock()
+	if !r.firstSynced {
+		res := r.pool.Sync(r.startMode)
+		if res.Listed {
+			r.firstSynced = true
+			r.schedule(func() { r.startupDiag(r.pool.gwAddr(r.defGw), r.staticGroups) })
+		}
+		r.firstSyncMu.Unlock()
 		return
 	}
+	r.firstSyncMu.Unlock()
 	r.pool.Sync(syncClean)
 }
+
+// schedule tracks background control-plane work so Close can establish a
+// barrier before its final sweep. It is never used by the dynamic hit path.
+func (r *RouterOS) schedule(f func()) bool {
+	r.lifeMu.RLock()
+	if r.paused || r.closed {
+		r.lifeMu.RUnlock()
+		return false
+	}
+	r.opsWG.Add(1)
+	r.lifeMu.RUnlock()
+	go func() {
+		defer r.opsWG.Done()
+		f()
+	}()
+	return true
+}
+
+func (r *RouterOS) scheduleConnected() { r.schedule(r.onConnected) }
 
 var (
 	_ sequence.Executable            = (*RouterOS)(nil)
 	_ sequence.QuickConfigurableExec = (*RouterOS)(nil)
 	_ sequence.Executable            = (*gwExec)(nil)
 )
+
+func normalizeAddress(s string, useTLS bool) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+		return "", fmt.Errorf("invalid address %q", s)
+	}
+	defaultPort := 8728
+	if useTLS {
+		defaultPort = 8729
+	}
+	if host, port, err := net.SplitHostPort(s); err == nil {
+		if host == "" {
+			return "", fmt.Errorf("invalid address %q: empty host", s)
+		}
+		if _, err := netip.ParseAddr(host); err != nil && !validHostname(host) {
+			return "", fmt.Errorf("invalid address %q: bad host", s)
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("invalid address %q: bad port", s)
+		}
+		return net.JoinHostPort(host, port), nil
+	}
+
+	rawIP := strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
+	if ip, err := netip.ParseAddr(rawIP); err == nil {
+		return net.JoinHostPort(ip.String(), strconv.Itoa(defaultPort)), nil
+	}
+	if strings.Contains(s, ":") {
+		return "", fmt.Errorf("invalid address %q", s)
+	}
+	if !validHostname(s) {
+		return "", fmt.Errorf("invalid address %q", s)
+	}
+	return net.JoinHostPort(s, strconv.Itoa(defaultPort)), nil
+}
+
+func validHostname(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	s = strings.TrimSuffix(s, ".")
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+				(c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func Init(bp *coremain.BP, args any) (any, error) {
 	a := args.(*Args)
@@ -111,13 +197,11 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if a.Address == "" || a.Username == "" {
 		return nil, fmt.Errorf("address and username are required")
 	}
-	if !strings.Contains(a.Address, ":") {
-		if a.TLS {
-			a.Address += ":8729"
-		} else {
-			a.Address += ":8728"
-		}
+	address, err := normalizeAddress(a.Address, a.TLS)
+	if err != nil {
+		return nil, err
 	}
+	a.Address = address
 	timeout := 2 * time.Second
 	if a.Timeout != "" {
 		d, err := time.ParseDuration(a.Timeout)
@@ -128,6 +212,12 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	}
 	if a.Comment == "" {
 		a.Comment = "mosdns"
+	}
+	if a.MaxRoutes < 0 {
+		return nil, fmt.Errorf("max_routes must be greater than zero, or zero for the default")
+	}
+	if a.Distance < 0 || a.Distance > 255 {
+		return nil, fmt.Errorf("distance must be between 1 and 255, or zero for the default")
 	}
 	if a.Gateway == "" {
 		return nil, fmt.Errorf("gateway is required")
@@ -175,7 +265,12 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		distance:           a.Distance,
 	}, l)
 
-	p := newPool(cl, l, poolConfig{maxDyn: a.MaxRoutes, replace: replace})
+	p := newPool(cl, l, poolConfig{
+		maxDyn:       a.MaxRoutes,
+		replace:      replace,
+		routingTable: a.RoutingTable,
+		distance:     a.Distance,
+	})
 	defIdx, err := p.gateway(defGw)
 	if err != nil {
 		return nil, err
@@ -215,15 +310,16 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		startMode:    startMode,
 		staticGroups: a.Static,
 		queue:        make(chan func(), asyncQueueSize),
+		queueSlots:   make(chan struct{}, asyncQueueSize),
 	}
-	cl.onReconnect = r.onConnected
+	cl.onReconnect = r.scheduleConnected
 
 	// Connect. A login rejection is fatal; a network error only logs and the
 	// client keeps retrying in the background so DNS service is not held
 	// hostage by the switch. The on_start sync runs on whichever connection
 	// succeeds first.
 	if err := cl.Connect(); err != nil {
-		if isDeviceError(err) {
+		if isTrap(err) {
 			return nil, fmt.Errorf("routeros login failed: %w", err)
 		}
 		l.Warn("routeros api unreachable at startup; will retry in background", zap.Error(err))
@@ -237,7 +333,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	}
 
 	if !wait {
-		r.wg.Add(1)
+		r.workerWG.Add(1)
 		go r.worker()
 	}
 
@@ -303,35 +399,60 @@ func (r *RouterOS) exec(_ context.Context, qCtx *query_context.Context, gw uint8
 		return nil
 	}
 
-	acts, removeIDs := r.pool.Learn(ips, gw)
-	if len(acts) == 0 && len(removeIDs) == 0 {
+	// Preserve the original repeated-hit hot path: no lifecycle lock, queue
+	// operation or allocation beyond the already extracted answer slice.
+	if r.pool.FastHit(ips, gw) {
 		return nil
 	}
 
+	slotReserved := false
 	if !r.wait {
-		// Hold the read lock while enqueueing so Close() cannot close the
-		// channel underneath us (send on closed channel panics).
-		r.closeMu.RLock()
-		if r.closed {
-			r.closeMu.RUnlock()
-			r.pool.dropInflight(acts)
+		// Reserve capacity before mutating the pool. A saturated queue can
+		// therefore never require a lossy rollback of eviction state.
+		select {
+		case r.queueSlots <- struct{}{}:
+			slotReserved = true
+		default:
+			r.logger.Warn("routeros async queue full; dropping route update")
 			return nil
 		}
-		select {
-		case r.queue <- func() { r.pool.Apply(acts, removeIDs) }:
-		default:
-			r.logger.Warn("routeros async queue full; dropping route update", zap.Int("routes", len(acts)))
-			r.pool.dropInflight(acts)
+	}
+
+	r.lifeMu.RLock()
+	if r.paused || r.closed {
+		r.lifeMu.RUnlock()
+		if slotReserved {
+			<-r.queueSlots
 		}
-		r.closeMu.RUnlock()
+		return nil
+	}
+	acts, removeIDs := r.pool.Learn(ips, gw)
+	if len(acts) == 0 && len(removeIDs) == 0 {
+		r.lifeMu.RUnlock()
+		if slotReserved {
+			<-r.queueSlots
+		}
+		return nil
+	}
+	r.opsWG.Add(1)
+
+	if !r.wait {
+		r.queue <- func() {
+			defer r.opsWG.Done()
+			defer func() { <-r.queueSlots }()
+			r.pool.Apply(acts, removeIDs)
+		}
+		r.lifeMu.RUnlock()
 		return nil
 	}
 
 	done := make(chan struct{})
 	go func() {
+		defer r.opsWG.Done()
 		r.pool.Apply(acts, removeIDs)
 		close(done)
 	}()
+	r.lifeMu.RUnlock()
 	t := time.NewTimer(r.timeout)
 	defer t.Stop()
 	select {
@@ -347,27 +468,57 @@ func (r *RouterOS) exec(_ context.Context, qCtx *query_context.Context, gw uint8
 }
 
 func (r *RouterOS) worker() {
-	defer r.wg.Done()
+	defer r.workerWG.Done()
 	for f := range r.queue {
 		f()
 	}
 }
 
+func (r *RouterOS) flush() syncResult {
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+
+	r.lifeMu.Lock()
+	if r.closed {
+		r.lifeMu.Unlock()
+		return syncResult{Time: time.Now(), Err: "routeros plugin is closed"}
+	}
+	r.paused = true
+	r.lifeMu.Unlock()
+
+	// Existing operations are bounded by the client command watchdog. DNS
+	// requests arriving while paused return normally without adding routes.
+	r.opsWG.Wait()
+	res := r.pool.Flush()
+
+	r.lifeMu.Lock()
+	if !r.closed {
+		r.paused = false
+	}
+	r.lifeMu.Unlock()
+	return res
+}
+
 // Close removes our routes (if on_exit=clean) and disconnects.
 func (r *RouterOS) Close() error {
-	r.closeMu.Lock()
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+
+	r.lifeMu.Lock()
 	if r.closed {
-		r.closeMu.Unlock()
+		r.lifeMu.Unlock()
 		return nil
 	}
+	r.paused = true
 	r.closed = true
 	if !r.wait {
-		close(r.queue) // no sender can be inside the RLock section now
+		close(r.queue) // no producer can hold lifeMu.RLock now
 	}
-	r.closeMu.Unlock()
+	r.lifeMu.Unlock()
 
+	r.opsWG.Wait()
 	if !r.wait {
-		r.wg.Wait() // drain queued route updates before cleanup
+		r.workerWG.Wait()
 	}
 	r.pool.Close(r.onExit == "clean")
 	return r.cl.Close()
@@ -396,7 +547,7 @@ func (r *RouterOS) api() *chi.Mux {
 		writeJSON(w, out)
 	})
 	m.Post("/flush", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, r.pool.Flush())
+		writeJSON(w, r.flush())
 	})
 	return m
 }

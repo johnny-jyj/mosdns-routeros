@@ -22,10 +22,18 @@ type fakeBackend struct {
 	removes   int // number of ids removed
 	removeCmd int // number of RemoveRoutes calls
 	addErr    error
+	table     string
+	distance  int
 }
 
 func newFake() *fakeBackend {
-	return &fakeBackend{connected: true, nextID: 1, routes: map[uint32]remoteRoute{}}
+	return &fakeBackend{
+		connected: true,
+		nextID:    1,
+		routes:    map[uint32]remoteRoute{},
+		table:     "main",
+		distance:  1,
+	}
 }
 
 func (f *fakeBackend) Connected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connected }
@@ -42,11 +50,11 @@ func (f *fakeBackend) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error) 
 	f.adds++
 	id := f.nextID
 	f.nextID++
-	f.routes[id] = remoteRoute{id: id, dst: dst, gw: gw}
+	f.routes[id] = remoteRoute{id: id, dst: dst, gw: gw, table: f.table, distance: f.distance}
 	return id, nil
 }
 
-func (f *fakeBackend) SetGateway(id uint32, gw netip.Addr) error {
+func (f *fakeBackend) SetRoute(id uint32, gw netip.Addr) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.connected {
@@ -57,6 +65,7 @@ func (f *fakeBackend) SetGateway(id uint32, gw netip.Addr) error {
 		return deviceErr("no such item")
 	}
 	r.gw = gw
+	r.distance = f.distance
 	f.routes[id] = r
 	f.sets++
 	return nil
@@ -91,11 +100,18 @@ func (f *fakeBackend) ListRoutes() ([]remoteRoute, error) {
 
 // inject adds a route directly to the "router" (as if created by someone else / a previous run).
 func (f *fakeBackend) inject(dst string, gw string) uint32 {
+	return f.injectAttrs(dst, gw, f.table, f.distance)
+}
+
+func (f *fakeBackend) injectAttrs(dst, gw, table string, distance int) uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := f.nextID
 	f.nextID++
-	f.routes[id] = remoteRoute{id: id, dst: netip.MustParsePrefix(dst), gw: netip.MustParseAddr(gw)}
+	f.routes[id] = remoteRoute{
+		id: id, dst: netip.MustParsePrefix(dst), gw: netip.MustParseAddr(gw),
+		table: table, distance: distance,
+	}
 	return id
 }
 
@@ -116,6 +132,13 @@ func (f *fakeBackend) find(dst string) (remoteRoute, bool) {
 func deviceErr(msg string) error {
 	s := proto.NewSentence()
 	s.Word = "!trap"
+	s.Map["message"] = msg
+	return &ros.DeviceError{Sentence: s}
+}
+
+func fatalErr(msg string) error {
+	s := proto.NewSentence()
+	s.Word = "!fatal"
 	s.Map["message"] = msg
 	return &ros.DeviceError{Sentence: s}
 }
@@ -525,8 +548,8 @@ func TestKeepConflictKeepsRouteWarm(t *testing.T) {
 	}
 }
 
-// #8: flush must not orphan routes whose add is still in flight.
-func TestFlushKeepsInflight(t *testing.T) {
+// Flush removes inflight pool entries; a late successful add is reclaimed.
+func TestFlushReclaimsInflight(t *testing.T) {
 	f := newFake()
 	p, a, _ := newTestPool(t, f, 100, false)
 	p.finishStatic()
@@ -534,14 +557,11 @@ func TestFlushKeepsInflight(t *testing.T) {
 	acts, _ := p.Learn([]netip.Addr{netip.MustParseAddr("2.2.2.2")}, a) // inflight, not applied yet
 	p.Flush()
 	p.Apply(acts, nil) // the late add completes
-	if st := p.Stats(); st.Dynamic != 1 || st.Synced != 1 {
-		t.Fatalf("inflight entry lost: %+v", st)
+	if st := p.Stats(); st.Dynamic != 0 {
+		t.Fatalf("flush retained inflight entry: %+v", st)
 	}
-	if f.count() != 1 {
-		t.Fatalf("router has %d routes, want 1", f.count())
-	}
-	if _, ok := f.find("2.2.2.2/32"); !ok {
-		t.Fatal("inflight route missing")
+	if f.count() != 0 {
+		t.Fatalf("router has %d routes after late add, want 0", f.count())
 	}
 }
 
@@ -577,6 +597,136 @@ func TestCloseRemovesStaleIDs(t *testing.T) {
 	p.Close(true)
 	if f.count() != 0 {
 		t.Fatalf("stale-id route left on router: %d", f.count())
+	}
+}
+
+func TestStaticLongestPrefixGateway(t *testing.T) {
+	f := newFake()
+	p, a, b := newTestPool(t, f, 100, false)
+	if err := p.addStatic(netip.MustParsePrefix("10.0.0.0/8"), gwA); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.addStatic(netip.MustParsePrefix("10.1.0.0/16"), gwB); err != nil {
+		t.Fatal(err)
+	}
+	p.finishStatic()
+
+	// The more-specific /16 via B wins; a request via A must not be treated
+	// as covered by the less-specific /8.
+	acts, rm := p.Learn([]netip.Addr{netip.MustParseAddr("10.1.2.3")}, a)
+	if len(acts) != 0 || len(rm) != 0 || p.Stats().Dynamic != 0 {
+		t.Fatalf("conflicting static coverage created dynamic work: acts=%d rm=%d stats=%+v", len(acts), len(rm), p.Stats())
+	}
+	if gw, ok := p.staticGateway(netip.MustParseAddr("10.1.2.3")); !ok || gw != b {
+		t.Fatalf("longest prefix gateway=%d ok=%v, want %d", gw, ok, b)
+	}
+}
+
+func TestSyncReconcilesTableAndDistance(t *testing.T) {
+	f := newFake()
+	f.table, f.distance = "vpn", 5
+	p := newPool(f, zap.NewNop(), poolConfig{
+		maxDyn: 100, routingTable: "vpn", distance: 5,
+	})
+	a, _ := p.gateway(gwA)
+	p.finishStatic()
+
+	f.mu.Lock()
+	f.connected = false
+	f.mu.Unlock()
+	p.Learn([]netip.Addr{netip.MustParseAddr("1.1.1.1")}, a) // offline pool truth
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
+	wrongTable := f.injectAttrs("1.1.1.1/32", gwA.String(), "main", 5)
+
+	res := p.Sync(syncClean)
+	if res.Added != 1 || res.Removed != 1 {
+		t.Fatalf("wrong-table reconcile: %+v", res)
+	}
+	if _, ok := f.routes[wrongTable]; ok {
+		t.Fatal("wrong-table route was retained")
+	}
+	r, ok := f.find("1.1.1.1/32")
+	if !ok || r.table != "vpn" || r.distance != 5 {
+		t.Fatalf("reconciled route=%+v ok=%v", r, ok)
+	}
+
+	// A distance-only drift is repaired in place.
+	f.mu.Lock()
+	for id, route := range f.routes {
+		route.distance = 1
+		f.routes[id] = route
+	}
+	f.mu.Unlock()
+	res = p.Sync(syncClean)
+	if res.Set != 1 || f.sets == 0 {
+		t.Fatalf("distance drift not repaired: %+v sets=%d", res, f.sets)
+	}
+}
+
+func TestSyncAdoptRepairsDistance(t *testing.T) {
+	f := newFake()
+	f.distance = 5
+	p := newPool(f, zap.NewNop(), poolConfig{maxDyn: 100, distance: 5})
+	p.finishStatic()
+	f.injectAttrs("1.1.1.1/32", gwA.String(), "main", 1)
+
+	res := p.Sync(syncAdopt)
+	if res.Set != 1 || p.Stats().Synced != 1 {
+		t.Fatalf("adopt did not repair distance: res=%+v stats=%+v", res, p.Stats())
+	}
+	r, _ := f.find("1.1.1.1/32")
+	if r.distance != 5 {
+		t.Fatalf("distance=%d, want 5", r.distance)
+	}
+}
+
+func TestFatalAddStaysOffline(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	f.addErr = fatalErr("session terminated")
+	learn(p, a, "1.1.1.1")
+	if st := p.Stats(); st.Offline != 1 || st.Dynamic != 1 {
+		t.Fatalf("fatal error lost pool truth: %+v", st)
+	}
+	if isTrap(f.addErr) || !isFatal(f.addErr) {
+		t.Fatalf("fatal classification trap=%v fatal=%v", isTrap(f.addErr), isFatal(f.addErr))
+	}
+}
+
+func BenchmarkLearnSyncedHit(b *testing.B) {
+	f := newFake()
+	p := newPool(f, zap.NewNop(), poolConfig{maxDyn: 100})
+	a, _ := p.gateway(gwA)
+	p.finishStatic()
+	ip := netip.MustParseAddr("1.1.1.1")
+	acts, rm := p.Learn([]netip.Addr{ip}, a)
+	p.Apply(acts, rm)
+	ips := []netip.Addr{ip}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Learn(ips, a)
+	}
+}
+
+func BenchmarkFastHit(b *testing.B) {
+	f := newFake()
+	p := newPool(f, zap.NewNop(), poolConfig{maxDyn: 100})
+	a, _ := p.gateway(gwA)
+	p.finishStatic()
+	ip := netip.MustParseAddr("1.1.1.1")
+	acts, rm := p.Learn([]netip.Addr{ip}, a)
+	p.Apply(acts, rm)
+	ips := []netip.Addr{ip}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.FastHit(ips, a) {
+			b.Fatal("miss")
+		}
 	}
 }
 

@@ -6,7 +6,7 @@
 
 ## 工作方式
 
-- 使用 [go-routeros v3](https://github.com/go-routeros/routeros) 建立**一条**持久 API 连接（8728，或 8729 TLS），`Async` 模式多路复用，所有命令复用该连接，没有每命令握手。
+- 使用 [go-routeros v3](https://github.com/go-routeros/routeros) 建立**一条**持久 API 连接（8728，或 8729 TLS），`Async` 模式多路复用，所有命令复用该连接，没有每命令握手。`third_party/go-routeros` 固定了上游 [PR #32](https://github.com/go-routeros/routeros/pull/32) 的最小修复，并补上 Async 已结束时的 writer 解锁，避免快速回复丢失、单请求取消破坏共享 reader 或后续命令永久阻塞。
 - 插件自己维护路由池：同一 IP 重复解析不再调用 API；同一 IP 出现不同 gateway 时打 warning，按 `conflict` 策略处理；被 `static` CIDR 覆盖的 IP 不重复添加。
 - 所有路由带统一 `comment` 作为归属标记。启动时读取路由器上带该标记的路由并对账（接管 / 纠正 gateway / 补加 / 删除），退出时按 `on_exit` 清理，断线重连后自动再对账一次。
 - 运行期间**不会**按时间删除动态路由（RouterOS 侧没有过期机制，插件也不做，避免与 cache 的 TTL 纠缠）。清理手段：退出、`POST /flush`、`max_routes` 上限触发的近似 LRU 淘汰，或定时重启 mosdns。
@@ -26,7 +26,7 @@ plugins:
       password: "******"
       tls: false                   # true 走 API-SSL；只影响启动时的一次握手
       insecure_skip_verify: false  # tls=true 且自签证书时置 true
-      timeout: 2s                  # 拨号/登录超时，也是 wait 模式下等待 add 的上限
+      timeout: 2s                  # 拨号/登录及 add/set 命令超时，也是 wait 模式等待上限；批量 list/remove 至少 30s
 
       # --- 路由属性 ---
       gateway: 192.168.88.254      # 默认下一跳；$ros 不带参数时使用；必须是 IPv4 主机地址

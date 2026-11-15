@@ -24,9 +24,11 @@ var errNotConnected = errors.New("routeros: not connected")
 
 // remoteRoute is one /ip/route entry owned by this plugin (matched by comment).
 type remoteRoute struct {
-	id  uint32
-	dst netip.Prefix
-	gw  netip.Addr
+	id       uint32
+	dst      netip.Prefix
+	gw       netip.Addr
+	table    string
+	distance int
 }
 
 // backend is the RouterOS side as seen by the pool. It is an interface so the
@@ -34,7 +36,7 @@ type remoteRoute struct {
 type backend interface {
 	Connected() bool
 	AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error)
-	SetGateway(id uint32, gw netip.Addr) error
+	SetRoute(id uint32, gw netip.Addr) error
 	RemoveRoutes(ids []uint32) error
 	ListRoutes() ([]remoteRoute, error)
 }
@@ -57,8 +59,9 @@ type client struct {
 	cfg    clientConfig
 	logger *zap.Logger
 
-	mu        sync.Mutex // guards c and generation
+	mu        sync.Mutex // guards c, cancel and generation
 	c         *ros.Client
+	cancel    context.CancelFunc
 	gen       uint64 // incremented on every (re)connect
 	connected atomic.Bool
 	closed    atomic.Bool
@@ -105,30 +108,33 @@ func (cl *client) Connect() error {
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	errC := c.Async()
+	asyncCtx, asyncCancel := context.WithCancel(context.Background())
+	errC := c.AsyncContext(asyncCtx)
 
 	cl.mu.Lock()
 	if cl.closed.Load() {
 		// Close() raced with this connect: do not keep the new connection.
 		cl.mu.Unlock()
+		asyncCancel()
 		_ = c.Close()
 		return errNotConnected
 	}
 	cl.c = c
+	cl.cancel = asyncCancel
 	cl.gen++
 	gen := cl.gen
-	cl.mu.Unlock()
 	cl.connected.Store(true)
-
 	cl.wg.Add(1)
-	go cl.watch(gen, errC)
+	cl.mu.Unlock()
+	go cl.watch(gen, c, asyncCancel, errC)
 	return nil
 }
 
 // watch waits for the async read loop of connection gen to end and starts the
 // reconnect loop unless the client is being closed.
-func (cl *client) watch(gen uint64, errC <-chan error) {
+func (cl *client) watch(gen uint64, c *ros.Client, cancel context.CancelFunc, errC <-chan error) {
 	defer cl.wg.Done()
+	defer cancel() // releases AsyncContext's cancellation waiter
 	err, ok := <-errC
 	if cl.closed.Load() {
 		return
@@ -138,13 +144,11 @@ func (cl *client) watch(gen uint64, errC <-chan error) {
 		cl.mu.Unlock()
 		return
 	}
-	old := cl.c
 	cl.c = nil
-	cl.mu.Unlock()
+	cl.cancel = nil
 	cl.connected.Store(false)
-	if old != nil {
-		_ = old.Close()
-	}
+	cl.mu.Unlock()
+	_ = c.Close()
 	if !ok || err == nil {
 		err = errors.New("read loop ended")
 	}
@@ -187,9 +191,14 @@ func (cl *client) Close() error {
 	close(cl.closeCh)
 	cl.mu.Lock()
 	c := cl.c
+	cancel := cl.cancel
 	cl.c = nil
-	cl.mu.Unlock()
+	cl.cancel = nil
 	cl.connected.Store(false)
+	cl.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	var err error
 	if c != nil {
 		err = c.Close()
@@ -200,17 +209,54 @@ func (cl *client) Close() error {
 
 func (cl *client) Connected() bool { return cl.connected.Load() }
 
-// run executes one API sentence. It deliberately never passes a cancellable
-// context to the library: cancelling would Cancel() the shared reader and kill
-// every in-flight command on the connection.
+// run executes one API sentence with the configured command deadline. The
+// pinned go-routeros patch abandons only this command's tag on cancellation;
+// we then invalidate this connection generation so sync can resolve whether a
+// timed-out mutating command reached RouterOS.
 func (cl *client) run(words ...string) (*ros.Reply, error) {
+	return cl.runTimeout(cl.cfg.timeout, words...)
+}
+
+func (cl *client) runTimeout(timeout time.Duration, words ...string) (*ros.Reply, error) {
 	cl.mu.Lock()
 	c := cl.c
+	gen := cl.gen
 	cl.mu.Unlock()
 	if c == nil {
 		return nil, errNotConnected
 	}
-	return c.RunArgs(words)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	r, err := c.RunArgsContext(ctx, words)
+	if err != nil && !isTrap(err) {
+		cl.invalidate(gen, c)
+	}
+	return r, err
+}
+
+// invalidate closes c only if it is still the active connection generation.
+// The generation's watcher owns reconnecting, so concurrent command failures
+// cannot start duplicate reconnect loops.
+func (cl *client) invalidate(gen uint64, c *ros.Client) {
+	cl.mu.Lock()
+	if cl.gen != gen || cl.c != c {
+		cl.mu.Unlock()
+		return
+	}
+	cancel := cl.cancel
+	cl.c = nil
+	cl.cancel = nil
+	cl.connected.Store(false)
+	cl.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = c.Close()
+}
+
+func (cl *client) bulkTimeout() time.Duration {
+	const minBulkTimeout = 30 * time.Second
+	return max(cl.cfg.timeout, minBulkTimeout)
 }
 
 func (cl *client) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error) {
@@ -236,8 +282,14 @@ func (cl *client) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error) {
 	return parseID(r.Done.Map["ret"])
 }
 
-func (cl *client) SetGateway(id uint32, gw netip.Addr) error {
-	_, err := cl.run("/ip/route/set", "=.id="+formatID(id), "=gateway="+gw.String())
+func (cl *client) SetRoute(id uint32, gw netip.Addr) error {
+	words := []string{"/ip/route/set", "=.id=" + formatID(id), "=gateway=" + gw.String()}
+	if cl.cfg.distance > 0 {
+		words = append(words, "=distance="+strconv.Itoa(cl.cfg.distance))
+	} else {
+		words = append(words, "=distance=1")
+	}
+	_, err := cl.run(words...)
 	return err
 }
 
@@ -252,7 +304,7 @@ func (cl *client) RemoveRoutes(ids []uint32) error {
 		for i, id := range chunk {
 			parts[i] = formatID(id)
 		}
-		if _, err := cl.run("/ip/route/remove", "=numbers="+strings.Join(parts, ",")); err != nil && firstErr == nil {
+		if _, err := cl.runTimeout(cl.bulkTimeout(), "/ip/route/remove", "=numbers="+strings.Join(parts, ",")); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -261,7 +313,8 @@ func (cl *client) RemoveRoutes(ids []uint32) error {
 
 // ListRoutes returns every /ip/route whose comment equals ours.
 func (cl *client) ListRoutes() ([]remoteRoute, error) {
-	r, err := cl.run("/ip/route/print", "?comment="+cl.cfg.comment, "=.proplist=.id,dst-address,gateway")
+	r, err := cl.runTimeout(cl.bulkTimeout(), "/ip/route/print", "?comment="+cl.cfg.comment,
+		"=.proplist=.id,dst-address,gateway,routing-table,distance")
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +335,15 @@ func (cl *client) ListRoutes() ([]remoteRoute, error) {
 			// gateway can be an interface name or "a.b.c.d%iface"; not ours.
 			gw = netip.Addr{}
 		}
-		out = append(out, remoteRoute{id: id, dst: dst, gw: gw})
+		table := s.Map["routing-table"]
+		if table == "" {
+			table = "main"
+		}
+		distance, err := strconv.Atoi(s.Map["distance"])
+		if err != nil || distance <= 0 {
+			distance = 1
+		}
+		out = append(out, remoteRoute{id: id, dst: dst, gw: gw, table: table, distance: distance})
 	}
 	return out, nil
 }
@@ -325,11 +386,14 @@ func parseDst(s string) (netip.Prefix, error) {
 	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
-// isDeviceError reports whether err is a RouterOS !trap/!fatal (as opposed to
-// a transport error).
-func isDeviceError(err error) bool {
+func isTrap(err error) bool {
 	var de *ros.DeviceError
-	return errors.As(err, &de)
+	return errors.As(err, &de) && de.Sentence != nil && de.Sentence.Word == "!trap"
+}
+
+func isFatal(err error) bool {
+	var de *ros.DeviceError
+	return errors.As(err, &de) && de.Sentence != nil && de.Sentence.Word == "!fatal"
 }
 
 // zapSlogHandler forwards go-routeros' slog output (warn and above only) to zap.

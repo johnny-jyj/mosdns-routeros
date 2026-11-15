@@ -5,6 +5,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +40,13 @@ func TestLoadPrefixes(t *testing.T) {
 	if _, err := loadPrefixes(zap.NewNop(), nil, []string{filepath.Join(dir, "missing")}); err == nil {
 		t.Fatal("expected error for missing file")
 	}
+	tooLong := filepath.Join(dir, "too-long")
+	if err := os.WriteFile(tooLong, []byte(strings.Repeat("1", 70<<10)+"\n1.1.1.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPrefixes(zap.NewNop(), nil, []string{tooLong}); err == nil {
+		t.Fatal("scanner error was silently ignored")
+	}
 }
 
 func TestParseGateway(t *testing.T) {
@@ -55,6 +64,31 @@ func TestParseGateway(t *testing.T) {
 	}
 }
 
+func TestNormalizeAddress(t *testing.T) {
+	tests := []struct {
+		in   string
+		tls  bool
+		want string
+	}{
+		{"192.168.88.1", false, "192.168.88.1:8728"},
+		{"router.example", true, "router.example:8729"},
+		{"router.example:9000", false, "router.example:9000"},
+		{"2001:db8::1", false, "[2001:db8::1]:8728"},
+		{"[2001:db8::1]:9000", true, "[2001:db8::1]:9000"},
+	}
+	for _, tt := range tests {
+		got, err := normalizeAddress(tt.in, tt.tls)
+		if err != nil || got != tt.want {
+			t.Errorf("normalizeAddress(%q): got %q, %v; want %q", tt.in, got, err, tt.want)
+		}
+	}
+	for _, bad := range []string{"", "host:bad", "host:70000", "bad host", "bad/name", "bad/name:8728", ":8728"} {
+		if got, err := normalizeAddress(bad, false); err == nil {
+			t.Errorf("normalizeAddress(%q) accepted as %q", bad, got)
+		}
+	}
+}
+
 // Review #2: the first successful connection applies on_start (adopt), later
 // ones clean. startupDiag is skipped here because cl is nil.
 func TestOnConnectedFirstTimeAdopts(t *testing.T) {
@@ -62,20 +96,43 @@ func TestOnConnectedFirstTimeAdopts(t *testing.T) {
 	p, _, _ := newTestPool(t, f, 100, false)
 	p.finishStatic()
 	f.inject("1.1.1.1/32", "192.168.88.254")
-	r := &RouterOS{logger: zap.NewNop(), pool: p, startMode: syncAdopt}
-	r.firstSynced.Store(false)
+	r := &RouterOS{logger: zap.NewNop(), pool: p, startMode: syncAdopt, paused: true}
 
 	// simulate: first connect happened late (startup dial failed) -> must adopt
-	r.pool.Sync(r.startMode)
-	r.firstSynced.Store(true)
+	r.onConnected()
 	if p.Stats().Dynamic != 1 || f.count() != 1 {
 		t.Fatalf("first sync did not adopt: %+v", p.Stats())
 	}
 	// a later reconnect with an unknown route on the router -> clean
+	r.paused = false
 	f.inject("2.2.2.2/32", "192.168.88.254")
 	r.onConnected()
 	if p.Stats().Dynamic != 1 || f.count() != 1 {
 		t.Fatalf("reconnect sync did not clean: %+v count=%d", p.Stats(), f.count())
+	}
+}
+
+func TestOnConnectedRetriesInitialAdoptAfterListFailure(t *testing.T) {
+	f := newFake()
+	p, _, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	r := &RouterOS{logger: zap.NewNop(), pool: p, startMode: syncAdopt, paused: true}
+
+	f.mu.Lock()
+	f.connected = false
+	f.mu.Unlock()
+	r.onConnected()
+	if r.firstSynced {
+		t.Fatal("failed initial list consumed adopt mode")
+	}
+
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
+	f.inject("1.1.1.1/32", gwA.String())
+	r.onConnected()
+	if !r.firstSynced || p.Stats().Dynamic != 1 || f.count() != 1 {
+		t.Fatalf("retry did not adopt: first=%v stats=%+v count=%d", r.firstSynced, p.Stats(), f.count())
 	}
 }
 
@@ -84,8 +141,12 @@ func TestAsyncExecAfterClose(t *testing.T) {
 	f := newFake()
 	p, a, _ := newTestPool(t, f, 100, false)
 	p.finishStatic()
-	r := &RouterOS{logger: zap.NewNop(), pool: p, defGw: a, wait: false, timeout: time.Second, queue: make(chan func(), 4)}
-	r.wg.Add(1)
+	r := &RouterOS{
+		logger: zap.NewNop(), cl: newClient(clientConfig{}, zap.NewNop()),
+		pool: p, defGw: a, wait: false, timeout: time.Second, onExit: "keep",
+		queue: make(chan func(), 4), queueSlots: make(chan struct{}, 4),
+	}
+	r.workerWG.Add(1)
 	go r.worker()
 
 	q := new(dns.Msg)
@@ -108,11 +169,9 @@ func TestAsyncExecAfterClose(t *testing.T) {
 			_ = r.Exec(context.Background(), mk(byte(i)))
 		}
 	}()
-	r.closeMu.Lock()
-	r.closed = true
-	close(r.queue)
-	r.closeMu.Unlock()
-	r.wg.Wait()
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
 	<-done
 	if st := p.Stats(); st.Inflight != 0 {
 		t.Fatalf("inflight entries left after close: %+v", st)
@@ -170,4 +229,117 @@ func TestExecExtractsARecords(t *testing.T) {
 	if err := r.Exec(context.Background(), query_context.NewContext(q)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestAsyncQueueFullDoesNotMutatePool(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	r := &RouterOS{
+		logger: zap.NewNop(), pool: p, defGw: a, wait: false, timeout: time.Second,
+		queue: make(chan func(), 1), queueSlots: make(chan struct{}, 1),
+	}
+	r.queueSlots <- struct{}{} // reserve the only slot
+	if err := r.Exec(context.Background(), queryWithA(1)); err != nil {
+		t.Fatal(err)
+	}
+	if st := p.Stats(); st.Dynamic != 0 || st.Inflight != 0 {
+		t.Fatalf("queue-full Exec mutated pool: %+v", st)
+	}
+}
+
+type blockingBackend struct {
+	*fakeBackend
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBackend) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.fakeBackend.AddRoute(dst, gw)
+}
+
+func TestCloseWaitsForWaitModeApply(t *testing.T) {
+	be := &blockingBackend{fakeBackend: newFake(), started: make(chan struct{}), release: make(chan struct{})}
+	p := newPool(be, zap.NewNop(), poolConfig{maxDyn: 100})
+	a, _ := p.gateway(gwA)
+	p.finishStatic()
+	r := &RouterOS{
+		logger: zap.NewNop(), cl: newClient(clientConfig{}, zap.NewNop()), pool: p,
+		defGw: a, wait: true, timeout: 5 * time.Millisecond, onExit: "clean",
+	}
+	if err := r.Exec(context.Background(), queryWithA(1)); err != nil {
+		t.Fatal(err)
+	}
+	<-be.started
+
+	closed := make(chan struct{})
+	go func() {
+		_ = r.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned before inflight Apply completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(be.release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after Apply was released")
+	}
+	if be.count() != 0 {
+		t.Fatalf("Close(clean) left %d routes", be.count())
+	}
+}
+
+func TestFlushWaitsForInflightApply(t *testing.T) {
+	be := &blockingBackend{fakeBackend: newFake(), started: make(chan struct{}), release: make(chan struct{})}
+	p := newPool(be, zap.NewNop(), poolConfig{maxDyn: 100})
+	a, _ := p.gateway(gwA)
+	p.finishStatic()
+	r := &RouterOS{
+		logger: zap.NewNop(), pool: p, defGw: a, wait: true, timeout: 5 * time.Millisecond,
+	}
+	if err := r.Exec(context.Background(), queryWithA(1)); err != nil {
+		t.Fatal(err)
+	}
+	<-be.started
+
+	done := make(chan syncResult, 1)
+	go func() { done <- r.flush() }()
+	select {
+	case <-done:
+		t.Fatal("Flush returned before inflight Apply completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(be.release)
+	select {
+	case res := <-done:
+		if res.Err != "" {
+			t.Fatalf("flush result: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Flush did not finish after Apply was released")
+	}
+	if be.count() != 0 || p.Stats().Dynamic != 0 {
+		t.Fatalf("flush left router=%d pool=%+v", be.count(), p.Stats())
+	}
+}
+
+func queryWithA(ip byte) *query_context.Context {
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	resp := new(dns.Msg)
+	resp.SetReply(q)
+	resp.Answer = []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET},
+		A:   []byte{1, 1, 1, ip},
+	}}
+	qc := query_context.NewContext(q)
+	qc.SetResponse(resp)
+	return qc
 }

@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
 	github.com/go-chi/chi/v5 v5.2.5
-	github.com/go-routeros/routeros/v3 v3.0.1
+	github.com/go-routeros/routeros/v3 v3.0.2-0.20260810014655-6e4fd2ed57ae
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/google/nftables v0.3.0
 	github.com/kardianos/service v1.2.4
@@ -30,6 +30,9 @@ require (
 )
 
 replace github.com/nadoo/ipset v0.5.0 => github.com/IrineSistiana/ipset v0.5.1-0.20220703061533-6e0fc3b04c0a
+
+// Based on v3.0.1 + PR #32, plus the async-ended writer-unlock fix.
+replace github.com/go-routeros/routeros/v3 => ./third_party/go-routeros
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

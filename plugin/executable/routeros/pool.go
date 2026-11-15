@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"go.uber.org/zap"
 )
 
@@ -55,6 +55,7 @@ const (
 
 type syncResult struct {
 	Time    time.Time `json:"time"`
+	Listed  bool      `json:"listed"`
 	Router  int       `json:"router"`
 	Pool    int       `json:"pool"`
 	Adopted int       `json:"adopted"`
@@ -81,8 +82,7 @@ type pool struct {
 	// static (immutable after newPool)
 	static      []staticEntry
 	staticExact map[netip.Prefix]int // prefix -> index in static
-	staticByGw  map[uint8]*netlist.List
-	staticAny   *netlist.List
+	staticBits  []int                // configured prefix lengths, longest first
 
 	// dynamic
 	mu        sync.RWMutex
@@ -92,6 +92,8 @@ type pool struct {
 	hand      int
 	maxDyn    int
 	replace   bool // conflict=replace
+	table     string
+	distance  int
 	closed    bool
 	syncMu    sync.Mutex // serialises Sync/Flush/Close
 	lastSync  atomic.Pointer[syncResult]
@@ -104,24 +106,32 @@ type pool struct {
 }
 
 type poolConfig struct {
-	maxDyn  int
-	replace bool
+	maxDyn       int
+	replace      bool
+	routingTable string
+	distance     int
 }
 
 func newPool(be backend, logger *zap.Logger, cfg poolConfig) *pool {
 	if cfg.maxDyn <= 0 {
 		cfg.maxDyn = defaultMaxDyn
 	}
+	if cfg.routingTable == "" {
+		cfg.routingTable = "main"
+	}
+	if cfg.distance == 0 {
+		cfg.distance = 1
+	}
 	return &pool{
 		be:          be,
 		logger:      logger,
 		gwIdx:       make(map[netip.Addr]uint8),
 		staticExact: make(map[netip.Prefix]int),
-		staticByGw:  make(map[uint8]*netlist.List),
-		staticAny:   netlist.NewList(),
 		dyn:         make(map[uint32]*dynEntry),
 		maxDyn:      cfg.maxDyn,
 		replace:     cfg.replace,
+		table:       cfg.routingTable,
+		distance:    cfg.distance,
 	}
 }
 
@@ -171,22 +181,35 @@ func (p *pool) addStatic(prefix netip.Prefix, gw netip.Addr) error {
 	}
 	p.staticExact[prefix] = len(p.static)
 	p.static = append(p.static, staticEntry{prefix: prefix, gw: gi})
-	l := p.staticByGw[gi]
-	if l == nil {
-		l = netlist.NewList()
-		p.staticByGw[gi] = l
-	}
-	l.Append(prefix)
-	p.staticAny.Append(prefix)
 	return nil
 }
 
-// finishStatic sorts the static matchers. Call once after the last addStatic.
+// finishStatic builds the immutable longest-prefix matcher. Call once after
+// the last addStatic.
 func (p *pool) finishStatic() {
-	for _, l := range p.staticByGw {
-		l.Sort()
+	var present [33]bool
+	for _, s := range p.static {
+		present[s.prefix.Bits()] = true
 	}
-	p.staticAny.Sort()
+	p.staticBits = p.staticBits[:0]
+	for bits, ok := range present {
+		if ok {
+			p.staticBits = append(p.staticBits, bits)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(p.staticBits)))
+}
+
+// staticGateway performs IPv4 longest-prefix matching using only the prefix
+// lengths that are actually configured. Static state is immutable after Init.
+func (p *pool) staticGateway(addr netip.Addr) (uint8, bool) {
+	for _, bits := range p.staticBits {
+		pf := netip.PrefixFrom(addr, bits).Masked()
+		if idx, ok := p.staticExact[pf]; ok {
+			return p.static[idx].gw, true
+		}
+	}
+	return 0, false
 }
 
 // action is one API operation produced by Learn, executed outside the lock.
@@ -202,6 +225,27 @@ const (
 	actAdd uint8 = iota
 	actSet
 )
+
+// FastHit handles the common case where every answer already has a synced
+// dynamic route through gi. It deliberately contains only the original hot
+// path operations: one shared lock, map lookups and atomic CLOCK ref stores.
+func (p *pool) FastHit(ips []netip.Addr, gi uint8) bool {
+	p.mu.RLock()
+	for _, addr := range ips {
+		if !addr.Is4() {
+			continue
+		}
+		ip := binary.BigEndian.Uint32(addr.AsSlice())
+		e := p.dyn[ip]
+		if e == nil || e.gw != gi || e.state != stateSynced {
+			p.mu.RUnlock()
+			return false
+		}
+		e.ref.Store(true)
+	}
+	p.mu.RUnlock()
+	return true
+}
 
 // Learn is the hot path: make sure every ip in ips has a route via gateway gi.
 // It returns the pending actions (API calls) the caller must run via Apply.
@@ -223,14 +267,13 @@ func (p *pool) Learn(ips []netip.Addr, gi uint8) (acts []action, removeIDs []uin
 		}
 		p.mu.RUnlock()
 
-		// 2. static coverage (immutable, no lock)
-		if l := p.staticByGw[gi]; l != nil && l.Contains(addr) {
-			continue // already covered by a static CIDR to the same gateway
-		}
-		if p.staticAny.Contains(addr) {
-			if p.warnConflict.allow() {
+		// 2. static coverage (immutable, no lock). Longest-prefix matching is
+		// required when static groups overlap across gateways.
+		if staticGw, ok := p.staticGateway(addr); ok {
+			if staticGw != gi && p.warnConflict.allow() {
 				p.logger.Warn("dynamic route ignored: covered by a static route with another gateway",
-					zap.Stringer("ip", addr), zap.Stringer("gateway", p.gwAddr(gi)))
+					zap.Stringer("ip", addr), zap.Stringer("static_gateway", p.gwAddr(staticGw)),
+					zap.Stringer("requested_gateway", p.gwAddr(gi)))
 			}
 			continue
 		}
@@ -385,30 +428,40 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 		switch a.kind {
 		case actAdd:
 			id, err := p.be.AddRoute(netip.PrefixFrom(ipFromU32(a.e.ip), 32), a.gw)
+			orphan := false
 			p.mu.Lock()
 			if a.e.state == stateInflight && p.dyn[a.e.ip] == a.e {
 				switch {
 				case err == nil:
 					a.e.id, a.e.state = id, stateSynced
-				case errors.Is(err, errNotConnected) || !isDeviceError(err):
+				case errors.Is(err, errNotConnected) || !isTrap(err):
 					a.e.state = stateOffline // transport problem: retry via sync
 				default:
 					p.removeLocked(a.e) // router rejected it; forget and retry on next query
 				}
+			} else if err == nil {
+				// Flush/Close removed this inflight entry while the API command
+				// was running. Reclaim the late route immediately.
+				orphan = true
 			}
 			p.mu.Unlock()
+			if orphan {
+				if rmErr := p.be.RemoveRoutes([]uint32{id}); rmErr != nil {
+					p.logger.Warn("remove late orphan route failed", zap.Uint32("id", id), zap.Error(rmErr))
+				}
+			}
 			if err != nil {
 				p.logger.Warn("add route failed", zap.Stringer("ip", ipFromU32(a.e.ip)), zap.Stringer("gateway", a.gw), zap.Error(err))
 			}
 		case actSet:
-			err := p.be.SetGateway(a.e.id, a.gw)
+			err := p.be.SetRoute(a.e.id, a.gw)
 			readd := false
 			p.mu.Lock()
 			if a.e.state == stateInflight && p.dyn[a.e.ip] == a.e {
 				switch {
 				case err == nil:
 					a.e.state = stateSynced
-				case !isDeviceError(err):
+				case !isTrap(err):
 					a.e.state = stateOffline // transport: retried on next query / sync
 				case a.oldSyn:
 					a.e.gw, a.e.state = a.oldGw, stateSynced // conflict replace rejected; router kept the old gateway
@@ -436,31 +489,17 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 	}
 }
 
-// dropInflight undoes the pool side of actions that will never be executed
-// (async queue full): adds are forgotten, sets are rolled back.
-func (p *pool) dropInflight(acts []action) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range acts {
-		if p.dyn[a.e.ip] != a.e || a.e.state != stateInflight {
-			continue
-		}
-		switch a.kind {
-		case actAdd:
-			p.removeLocked(a.e)
-		case actSet:
-			a.e.gw, a.e.state = a.oldGw, stateSynced
-		}
-	}
-}
-
 // Sync reconciles the router with the pool. See the plan: adopt matching
 // routes, fix gateways, add missing ones, and either adopt or remove unknown
 // ones depending on mode. Returns the summary; logs exactly one line.
 func (p *pool) Sync(mode syncMode) syncResult {
 	p.syncMu.Lock()
 	defer p.syncMu.Unlock()
+	return p.syncLocked(mode)
+}
 
+// syncLocked reconciles while the caller holds syncMu.
+func (p *pool) syncLocked(mode syncMode) syncResult {
 	res := syncResult{Time: time.Now()}
 	remote, err := p.be.ListRoutes()
 	if err != nil {
@@ -470,6 +509,7 @@ func (p *pool) Sync(mode syncMode) syncResult {
 		p.logger.Error("routeros sync: list routes failed", zap.Error(err))
 		return res
 	}
+	res.Listed = true
 	res.Router = len(remote)
 
 	type setOp struct {
@@ -491,6 +531,12 @@ func (p *pool) Sync(mode syncMode) syncResult {
 	p.mu.Lock()
 	res.Pool = len(p.static) + len(p.dyn)
 	for _, r := range remote {
+		// A route in another table cannot satisfy this pool. Removing it first
+		// avoids set conflicts when a desired-table duplicate also exists.
+		if r.table != p.table {
+			removeIDs = append(removeIDs, r.id)
+			continue
+		}
 		// static?
 		if idx, ok := p.staticExact[r.dst]; ok {
 			s := &p.static[idx]
@@ -500,7 +546,7 @@ func (p *pool) Sync(mode syncMode) syncResult {
 			}
 			seenStatic[idx] = true
 			s.id, s.synced = r.id, true
-			if r.gw != p.gwAddr(s.gw) {
+			if r.gw != p.gwAddr(s.gw) || r.distance != p.distance {
 				sets = append(sets, setOp{id: r.id, gw: p.gwAddr(s.gw), s: s})
 			} else {
 				res.Adopted++
@@ -518,7 +564,8 @@ func (p *pool) Sync(mode syncMode) syncResult {
 		case e == nil:
 			// Adopt only when it is a plausible dynamic route: valid IP gateway,
 			// not a duplicate, and not covered by a static CIDR (static wins).
-			if mode == syncAdopt && r.gw.IsValid() && !seenDyn[ip] && !p.staticAny.Contains(r.dst.Addr()) {
+			_, coveredByStatic := p.staticGateway(r.dst.Addr())
+			if mode == syncAdopt && r.gw.IsValid() && !seenDyn[ip] && !coveredByStatic {
 				adoptDyn = append(adoptDyn, r)
 				seenDyn[ip] = true
 			} else {
@@ -532,7 +579,7 @@ func (p *pool) Sync(mode syncMode) syncResult {
 		default:
 			seenDyn[ip] = true
 			e.id, e.state = r.id, stateSynced
-			if r.gw != p.gwAddr(e.gw) {
+			if r.gw != p.gwAddr(e.gw) || r.distance != p.distance {
 				e.state = stateInflight
 				sets = append(sets, setOp{id: r.id, gw: p.gwAddr(e.gw), e: e})
 			} else {
@@ -562,14 +609,19 @@ func (p *pool) Sync(mode syncMode) syncResult {
 		ip := binary.BigEndian.Uint32(r.dst.Addr().AsSlice())
 		e := &dynEntry{ip: ip, id: r.id, gw: gi, state: stateSynced}
 		p.insertLocked(e)
-		res.Adopted++
+		if r.distance != p.distance {
+			e.state = stateInflight
+			sets = append(sets, setOp{id: r.id, gw: p.gwAddr(gi), e: e})
+		} else {
+			res.Adopted++
+		}
 	}
 	p.mu.Unlock()
 
 	// --- API calls outside the lock ---
 	var failed bool
 	for _, op := range sets {
-		err := p.be.SetGateway(op.id, op.gw)
+		err := p.be.SetRoute(op.id, op.gw)
 		if op.e != nil {
 			p.mu.Lock()
 			if p.dyn[op.e.ip] == op.e && op.e.state == stateInflight {
@@ -602,18 +654,27 @@ func (p *pool) Sync(mode syncMode) syncResult {
 	}
 	for _, e := range addDyn {
 		id, err := p.be.AddRoute(netip.PrefixFrom(ipFromU32(e.ip), 32), p.gwAddr(e.gw))
+		orphan := false
 		p.mu.Lock()
 		if p.dyn[e.ip] == e && e.state == stateInflight {
 			switch {
 			case err == nil:
 				e.id, e.state = id, stateSynced
-			case isDeviceError(err):
+			case isTrap(err):
 				p.removeLocked(e)
 			default:
 				e.state = stateOffline
 			}
+		} else if err == nil {
+			orphan = true
 		}
 		p.mu.Unlock()
+		if orphan {
+			if rmErr := p.be.RemoveRoutes([]uint32{id}); rmErr != nil {
+				failed = true
+				p.logger.Debug("sync: remove late orphan failed", zap.Uint32("id", id), zap.Error(rmErr))
+			}
+		}
 		if err != nil {
 			failed = true
 			p.logger.Debug("sync: add dynamic failed", zap.Stringer("ip", ipFromU32(e.ip)), zap.Error(err))
@@ -677,16 +738,15 @@ func (p *pool) filterOwnedIDs(ids []uint32) []uint32 {
 }
 
 // Flush drops every dynamic entry and removes it from the router, then runs a
-// clean sync to catch anything left over. Entries whose add/set is still in
-// flight are kept: their goroutine will settle them and the following sync
-// sees them as regular pool members instead of orphans on the router.
+// clean sync to catch anything left over. A late inflight add sees that its
+// entry is no longer owned and removes the returned id in Apply.
 func (p *pool) Flush() syncResult {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+
 	p.mu.Lock()
 	ids := make([]uint32, 0, len(p.dyn))
 	for _, e := range p.dyn {
-		if e.state == stateInflight {
-			continue
-		}
 		if e.id != 0 {
 			ids = append(ids, e.id)
 		}
@@ -698,12 +758,15 @@ func (p *pool) Flush() syncResult {
 			p.logger.Warn("flush: remove failed", zap.Error(err))
 		}
 	}
-	return p.Sync(syncClean)
+	return p.syncLocked(syncClean)
 }
 
 // Close marks the pool closed. If clean is true every route the plugin owns is
 // removed from the router, with a final list-by-comment sweep.
 func (p *pool) Close(clean bool) {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+
 	p.mu.Lock()
 	p.closed = true
 	ids := make([]uint32, 0, len(p.dyn)+len(p.static))

@@ -53,6 +53,9 @@ func loadPrefixes(logger *zap.Logger, ips []string, files []string) ([]netip.Pre
 			}
 			out = append(out, p)
 		}
+		if err := sc.Err(); err != nil {
+			return nil, fmt.Errorf("failed to scan %s: %w", f, err)
+		}
 	}
 	if skipped > 0 {
 		logger.Warn("skipped IPv6 entries in static routes (IPv4 only)", zap.Int("count", skipped))
