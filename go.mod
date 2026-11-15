@@ -31,7 +31,12 @@ require (
 
 replace github.com/nadoo/ipset v0.5.0 => github.com/IrineSistiana/ipset v0.5.1-0.20220703061533-6e0fc3b04c0a
 
-// Based on v3.0.1 + PR #32, plus the async-ended writer-unlock fix.
+// TEMPORARY LOCAL OVERRIDE — the build uses ./third_party/go-routeros, not the
+// version above. Upstream v3.0.1 and unmerged PR #32 do not contain all fixes
+// documented in third_party/go-routeros/PATCHES.md. Before EVERY go-routeros
+// upgrade, compare upstream with that patch list, port or remove each patch,
+// and rerun its race tests. Delete this replace as soon as upstream contains
+// all fixes (or move the patches to a remotely pinned fork pseudo-version).
 replace github.com/go-routeros/routeros/v3 => ./third_party/go-routeros
 
 require (

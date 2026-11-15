@@ -20,6 +20,15 @@ resolution:
   follow_up_findings: 3
   unresolved_findings: 0
 
+dependency_override:
+  module: github.com/go-routeros/routeros/v3
+  source: ./third_party/go-routeros
+  temporary: true
+  require_version_is_build_source: false
+  patch_manifest: third_party/go-routeros/PATCHES.md
+  upgrade_check_required: true
+  preferred_exit: remotely pinned fork pseudo-version or fully fixed upstream
+
 verification:
   go_test_race: passed
   go_vet: passed

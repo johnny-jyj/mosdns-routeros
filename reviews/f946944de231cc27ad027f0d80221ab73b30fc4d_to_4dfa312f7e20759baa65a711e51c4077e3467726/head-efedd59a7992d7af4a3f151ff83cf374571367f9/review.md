@@ -31,6 +31,22 @@
 
 当前审查范围内没有已知未关闭问题。该结论不表示对未来代码或审查范围外组件作绝对无漏洞保证。
 
+## 依赖覆盖维护要求
+
+根 `go.mod` 中的 `replace github.com/go-routeros/routeros/v3 => ./third_party/go-routeros` 是**临时本地覆盖**。实际构建使用 `third_party/go-routeros`，而不是 `require` 行中的版本；因此只修改 require 或运行常规依赖升级不会同步 go-routeros 上游。
+
+保留本地副本的原因是：上游 v3.0.1 尚无 Async 修复，未合并的 PR #32 也没有包含本次故障注入发现的 writer/client 锁序、Close 解阻塞和 Cancel/Close 竞态修复。Go pseudo-version 只能引用远程仓库中已存在的 commit，不能引用这些仅存在于本项目的补丁。
+
+以后每次检查或升级 go-routeros 都必须：
+
+1. 检查 upstream tag/HEAD 与 PR #32 的状态。
+2. 对照 `third_party/go-routeros/PATCHES.md` 逐项判断补丁已合并、仍需要或已废弃。
+3. 只迁移仍需要的补丁，禁止直接用上游源码覆盖本地目录。
+4. 重跑依赖 race 测试、项目失败注入/并发测试、FastHit benchmark 和 RouterOS 实机 E2E。
+5. 补丁发布到远程 fork 后，优先改用 fork pseudo-version；上游包含全部修复后，必须删除本地 `replace`。
+
+该检查不是可选清理项，而是依赖升级的阻断条件。
+
 ## Change Description
 
 以下逐项记录问题原因、修复方法和验证结果。

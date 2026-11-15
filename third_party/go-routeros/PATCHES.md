@@ -18,3 +18,18 @@ the closing state under the mutex, then closes I/O without holding it.
 `proto/io_context.go` also uses `sync.Once` to close its cancellation channel.
 The upstream non-blocking send can be lost before a read starts, while racing
 `Cancel` with `Close` can send on a channel as it is being closed.
+
+## Mandatory upgrade checklist
+
+The root `go.mod` has a local `replace`, so changing its `require` version alone
+does **not** update the code used by the build. For every go-routeros upgrade:
+
+1. Check the upstream tag/HEAD and PR #32 status.
+2. Diff upstream against this directory and classify every local patch above
+   as merged, still required, or obsolete.
+3. Rebase/copy only the patches still required; never overwrite this directory
+   with upstream without that comparison.
+4. Run the module race tests and the parent project's RouterOS failure,
+   concurrency, benchmark, and real-device E2E tests.
+5. Prefer a remotely pinned fork pseudo-version once these patches are
+   published. Delete the local `replace` when upstream contains every fix.
