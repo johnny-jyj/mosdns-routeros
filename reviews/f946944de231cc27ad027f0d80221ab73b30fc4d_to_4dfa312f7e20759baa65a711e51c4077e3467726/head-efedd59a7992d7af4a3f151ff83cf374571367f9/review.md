@@ -7,11 +7,12 @@
 - 首个被审查提交：`f946944de231cc27ad027f0d80221ab73b30fc4d`
 - 被审查 HEAD：`4dfa312f7e20759baa65a711e51c4077e3467726`
 - 初始修复 HEAD：`efedd59a7992d7af4a3f151ff83cf374571367f9`
-- 当前验证代码 HEAD：`e0d58ec6ccbacde763942b45f5e98a4e44771d91`
+- 当前验证代码 HEAD：`084e096d3b1596d5969f85031a4df95645a53675`
 - 修复提交：
   - `624eb2f712e6100b406caa79e08781f39beb8e39` — `routeros: harden async lifecycle and reconciliation`
   - `efedd59a7992d7af4a3f151ff83cf374571367f9` — `routeros: close remaining timeout races`
   - `e0d58ec6ccbacde763942b45f5e98a4e44771d91` — `routeros: minimize local go-routeros patches`
+  - `084e096d3b1596d5969f85031a4df95645a53675` — `routeros: scope cancel fix to Async TCP reader`
 - 实现依据：`mosdns_routeros_plugin_c0119527.plan`
 - 重点目录：`plugin/executable/routeros/`
 - 状态：**已关闭；15 个有效问题全部修复，0 个已知未关闭项**
@@ -39,10 +40,14 @@
 
 保留本地副本的原因是：上游 v3.0.1 尚无 Async 修复；未合并的 PR #32 仍可能在 Async 已结束时返回而不释放 writer sentence 锁，也没有解决插件并发 Cancel/Close 时的取消丢失和关闭竞态。Go pseudo-version 只能引用远程仓库中已存在的 commit，不能引用这些仅存在于本项目的补丁。
 
-本地生产代码相对 PR #32 只保留两个、且均由当前插件使用的差异：`run.go` 的 writer 锁生命周期修复，以及 `proto/io_context.go` 的 Cancel/Close 一次性关闭修复。`client.go` 和插件未使用的 `Listen*` 路径保持 PR #32 原样；没有修改协议编码、登录、RouterOS sentence、路由命令或响应解析。
+本地生产代码相对 PR #32 只保留两个、且均由当前原生 TCP Async 路径使用的差异：`run.go` 的 writer 锁生命周期修复，以及 `proto/io_context.go` 中 reader Cancel/Close 的一次性关闭修复。`ctxWriter`、`client.go` 和插件未使用的 `Listen*` 路径保持 PR #32 原样；没有修改协议编码、登录、RouterOS sentence、路由命令或响应解析。
+
+项目目前使用 RouterOS 原生 TCP API。没有 HTTP 代码或 HTTP 改动；TLS 不是保留补丁的理由，也没有修改 TLS 握手、证书或传输行为。`run.go` 只提前操作本地 tag map，线上 sentence 的 command/arguments、`.tag` 和结束空 word 顺序不变；reader 修复只操作本地 goroutine channel，不发送 `/cancel` 或任何 RouterOS API word，因此两项修改均符合 RouterOS API wire behavior。
 
 PR #32 到当前本地生产代码的完整可应用 diff 已归档为
 `third_party/go-routeros/patches/0001-mosdns-run-cancel-lifecycle.patch`；配套说明见同目录 `README.md`。该 patch 已同时通过“在 PR #32 checkout 正向 apply check”和“在当前源码反向 apply check”。
+
+必要性证据也单独验证：`Cancel` 先于 `Read` 的确定性测试在原始 PR #32 上于 100 ms 后失败（取消被丢失），在当前 reader-only 修复上 race 模式重复 100 次通过。writer 侧恢复 PR #32 后，完整项目及依赖 race 测试仍通过。
 
 以后每次检查或升级 go-routeros 都必须：
 

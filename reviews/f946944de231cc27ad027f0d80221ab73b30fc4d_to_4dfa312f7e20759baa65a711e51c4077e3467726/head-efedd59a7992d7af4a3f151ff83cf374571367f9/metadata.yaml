@@ -13,12 +13,14 @@ review:
 resolution:
   status: closed
   initial_fixed_head: efedd59a7992d7af4a3f151ff83cf374571367f9
-  current_verified_head: e0d58ec6ccbacde763942b45f5e98a4e44771d91
+  current_verified_head: 084e096d3b1596d5969f85031a4df95645a53675
   dependency_minimization_commit: e0d58ec6ccbacde763942b45f5e98a4e44771d91
+  dependency_scope_commit: 084e096d3b1596d5969f85031a4df95645a53675
   commits:
     - 624eb2f712e6100b406caa79e08781f39beb8e39
     - efedd59a7992d7af4a3f151ff83cf374571367f9
     - e0d58ec6ccbacde763942b45f5e98a4e44771d91
+    - 084e096d3b1596d5969f85031a4df95645a53675
   original_findings: 12
   follow_up_findings: 3
   unresolved_findings: 0
@@ -33,6 +35,10 @@ dependency_override:
   production_files_changed_after_pr32:
     - run.go
     - proto/io_context.go
+  runtime_scope: native TCP Async reader and RunArgsContext only
+  http_changes: false
+  tls_specific_changes: false
+  writer_context_changes: false
   upgrade_check_required: true
   preferred_exit: remotely pinned fork pseudo-version or fully fixed upstream
 
