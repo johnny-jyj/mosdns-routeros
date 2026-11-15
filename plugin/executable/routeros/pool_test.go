@@ -520,6 +520,27 @@ func TestRetrySetOnDeletedRouteReadds(t *testing.T) {
 	}
 }
 
+func TestReplaceSetOnDeletedRouteReadds(t *testing.T) {
+	f := newFake()
+	p, a, b := newTestPool(t, f, 100, true)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1")
+	r, _ := f.find("1.1.1.1/32")
+	f.mu.Lock()
+	delete(f.routes, r.id) // external deletion while the pool still says synced
+	f.mu.Unlock()
+
+	learn(p, b, "1.1.1.1") // replace-set sees no-such-item and must re-add B
+	got, ok := f.find("1.1.1.1/32")
+	if st := p.Stats(); !ok || st.Synced != 1 || f.count() != 1 || f.adds != 2 || got.gw != gwB {
+		t.Fatalf("route=%+v ok=%v stats=%+v count=%d adds=%d", got, ok, st, f.count(), f.adds)
+	}
+	acts, rm := p.Learn([]netip.Addr{netip.MustParseAddr("1.1.1.1")}, b)
+	if len(acts) != 0 || len(rm) != 0 {
+		t.Fatal("re-added route was not a fast hit")
+	}
+}
+
 // Review #3: max_routes is a hard cap even when nothing is evictable.
 func TestMaxRoutesHardCap(t *testing.T) {
 	f := newFake()

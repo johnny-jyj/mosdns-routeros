@@ -261,6 +261,68 @@ func (b *blockingBackend) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, err
 	return b.fakeBackend.AddRoute(dst, gw)
 }
 
+type reconnectDuringFlushBackend struct {
+	*fakeBackend
+	reconnect func()
+	listOnce  sync.Once
+	added     chan struct{}
+	addOnce   sync.Once
+}
+
+func (b *reconnectDuringFlushBackend) ListRoutes() ([]remoteRoute, error) {
+	first := false
+	b.listOnce.Do(func() { first = true })
+	if first {
+		// Model the connection becoming usable after Flush started, but before
+		// its failed list command returned and the pause was released.
+		b.mu.Lock()
+		b.connected = true
+		b.mu.Unlock()
+		b.reconnect()
+		return nil, errNotConnected
+	}
+	return b.fakeBackend.ListRoutes()
+}
+
+func (b *reconnectDuringFlushBackend) AddRoute(dst netip.Prefix, gw netip.Addr) (uint32, error) {
+	id, err := b.fakeBackend.AddRoute(dst, gw)
+	if err == nil {
+		b.addOnce.Do(func() { close(b.added) })
+	}
+	return id, err
+}
+
+func TestFlushReplaysReconnectReceivedWhilePaused(t *testing.T) {
+	be := &reconnectDuringFlushBackend{
+		fakeBackend: newFake(),
+		added:       make(chan struct{}),
+	}
+	be.connected = false
+	p := newPool(be, zap.NewNop(), poolConfig{maxDyn: 100})
+	if err := p.addStatic(netip.MustParsePrefix("10.0.0.0/8"), gwA); err != nil {
+		t.Fatal(err)
+	}
+	p.finishStatic()
+	r := &RouterOS{
+		logger: zap.NewNop(), pool: p, startMode: syncClean, firstSynced: true,
+	}
+	be.reconnect = r.scheduleConnected
+
+	res := r.flush()
+	if res.Err == "" {
+		t.Fatal("setup did not make the Flush reconciliation fail")
+	}
+	select {
+	case <-be.added:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect received during Flush was not replayed")
+	}
+	r.opsWG.Wait()
+	if _, ok := be.find("10.0.0.0/8"); !ok {
+		t.Fatal("replayed reconnect did not restore the static route")
+	}
+}
+
 func TestCloseWaitsForWaitModeApply(t *testing.T) {
 	be := &blockingBackend{fakeBackend: newFake(), started: make(chan struct{}), release: make(chan struct{})}
 	p := newPool(be, zap.NewNop(), poolConfig{maxDyn: 100})

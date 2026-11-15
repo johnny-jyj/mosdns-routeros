@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -201,4 +202,66 @@ func TestTrapHandling(tt *testing.T) {
 	var devErr *DeviceError
 	require.True(t, errors.As(err, &devErr), "should've returned a DeviceError")
 	require.Contains(tt, devErr.Sentence.Map["message"], "entry already exists")
+}
+
+type blockedRWC struct {
+	closed       chan struct{}
+	writeStarted chan struct{}
+	closeOnce    sync.Once
+	writeOnce    sync.Once
+}
+
+func newBlockedRWC() *blockedRWC {
+	return &blockedRWC{closed: make(chan struct{}), writeStarted: make(chan struct{})}
+}
+
+func (c *blockedRWC) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (c *blockedRWC) Write([]byte) (int, error) {
+	c.writeOnce.Do(func() { close(c.writeStarted) })
+	<-c.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (c *blockedRWC) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestCloseUnblocksBlockedAsyncWriters(t *testing.T) {
+	conn := newBlockedRWC()
+	c, err := NewClient(conn)
+	require.NoError(t, err)
+	errC := c.Async()
+
+	run := func(done chan<- error) {
+		_, err := c.RunArgsContext(context.Background(), []string{"/blocked"})
+		done <- err
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go run(first)
+	<-conn.writeStarted // first command is blocked while flushing
+	go run(second)      // second command queues on the writer
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close() }()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind an async writer")
+	}
+	for i, done := range []<-chan error{first, second} {
+		select {
+		case err := <-done:
+			require.Error(t, err, "command %d unexpectedly succeeded", i+1)
+		case <-time.After(time.Second):
+			t.Fatalf("command %d remained blocked after Close", i+1)
+		}
+	}
+	<-errC
 }

@@ -47,14 +47,17 @@ func (c *Client) RunArgsContext(ctx context.Context, sentences []string) (*Reply
 	a.reC = make(chan *proto.Sentence)
 	a.tag = fmt.Sprintf("r%d", tag)
 
-	// Check the async loop and register the tag before constructing/sending
-	// the sentence. Holding mu until the writer lock is acquired prevents an
-	// async-loop shutdown from leaving BeginSentence's lock unreleased.
+	// Register the tag before sending so an immediate reply cannot be lost.
+	// Never hold mu while acquiring or using the writer: a blocked peer may
+	// keep the writer locked until Close shuts down the connection, and Close
+	// needs mu briefly to publish the closing state.
 	c.mu.Lock()
 	if c.tags == nil {
 		c.mu.Unlock()
 		return nil, errAsyncLoopEnded
 	}
+	c.tags[a.tag] = a
+	c.mu.Unlock()
 
 	c.w.BeginSentence()
 	for _, sentence := range sentences {
@@ -62,8 +65,6 @@ func (c *Client) RunArgsContext(ctx context.Context, sentences []string) (*Reply
 	}
 	c.w.WriteWord(".tag=" + a.tag)
 	c.logger().Debug("set tag", slog.String("tag", a.tag))
-	c.tags[a.tag] = a
-	c.mu.Unlock()
 
 	if err := c.w.EndSentence(); err != nil {
 		c.mu.Lock()

@@ -107,6 +107,57 @@ func TestCommandTimeoutInvalidatesGeneration(t *testing.T) {
 	}
 }
 
+func TestCommandTimeoutCoversBlockedSendAndQueuedWriter(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close() // the peer deliberately never reads
+	c, err := ros.NewClient(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asyncCtx, asyncCancel := context.WithCancel(context.Background())
+	errC := c.AsyncContext(asyncCtx)
+
+	cl := newClient(clientConfig{
+		address: "127.0.0.1:1",
+		timeout: 20 * time.Millisecond,
+	}, zap.NewNop())
+	cl.mu.Lock()
+	cl.c = c
+	cl.cancel = asyncCancel
+	cl.gen = 1
+	cl.connected.Store(true)
+	cl.wg.Add(1)
+	cl.mu.Unlock()
+	go cl.watch(1, c, asyncCancel, errC)
+
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := cl.run("/blocked-send")
+			done <- err
+		}()
+	}
+	close(start)
+	for i := range 2 {
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("command %d unexpectedly succeeded", i+1)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("command %d remained blocked past its deadline", i+1)
+		}
+	}
+	if cl.Connected() {
+		t.Fatal("send-timeout connection still reported connected")
+	}
+	if err := cl.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPatchedRequestCancellationKeepsSharedReader(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()

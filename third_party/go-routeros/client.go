@@ -146,17 +146,17 @@ func (c *Client) logger() *slog.Logger {
 // Close closes the connection to the RouterOS device.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.r.Close()
-	c.w.Close()
-
 	if c.closing {
+		c.mu.Unlock()
 		return nil
 	}
-
 	c.closing = true
+	c.mu.Unlock()
 
+	// Do not hold mu while aborting I/O. A command may be blocked acquiring or
+	// flushing the writer, and closing rwc is what releases that command.
+	c.r.Close()
+	c.w.Close()
 	return c.rwc.Close()
 }
 

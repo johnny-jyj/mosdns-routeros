@@ -227,6 +227,11 @@ func (cl *client) runTimeout(timeout time.Duration, words ...string) (*ros.Reply
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	// RunArgsContext only observes ctx after the sentence has been written.
+	// If the peer stops reading, force-close this exact generation at the
+	// deadline so a blocked Flush (and commands queued on the writer) unwind.
+	stopWatchdog := context.AfterFunc(ctx, func() { cl.invalidate(gen, c) })
+	defer stopWatchdog()
 	r, err := c.RunArgsContext(ctx, words)
 	if err != nil && !isTrap(err) {
 		cl.invalidate(gen, c)
@@ -389,6 +394,14 @@ func parseDst(s string) (netip.Prefix, error) {
 func isTrap(err error) bool {
 	var de *ros.DeviceError
 	return errors.As(err, &de) && de.Sentence != nil && de.Sentence.Word == "!trap"
+}
+
+func isNotFoundTrap(err error) bool {
+	var de *ros.DeviceError
+	if !errors.As(err, &de) || de.Sentence == nil || de.Sentence.Word != "!trap" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(de.Sentence.Map["message"]), "no such item")
 }
 
 func isFatal(err error) bool {

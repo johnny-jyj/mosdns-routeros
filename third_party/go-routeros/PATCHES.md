@@ -9,9 +9,11 @@ PR #32 fixes:
 - registering async reply tags after sending, which can drop fast replies;
 - cancelling the shared reader when one `RunArgsContext` is cancelled.
 
-The local follow-up in `run.go` and `listen.go` checks `c.tags` before taking
-the writer sentence lock. PR #32 otherwise returns with that lock held when the
-async loop has already ended, causing every later command to block forever.
+The local follow-up in `run.go` and `listen.go` registers tags before taking
+the writer sentence lock, but never holds the client mutex while waiting for
+or flushing the writer. This both prevents fast-reply loss and lets `Close`
+abort a write blocked by an unresponsive peer. `client.go` likewise publishes
+the closing state under the mutex, then closes I/O without holding it.
 
 `proto/io_context.go` also uses `sync.Once` to close its cancellation channel.
 The upstream non-blocking send can be lost before a read starts, while racing

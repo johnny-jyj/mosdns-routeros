@@ -461,6 +461,12 @@ func (p *pool) Apply(acts []action, removeIDs []uint32) {
 				switch {
 				case err == nil:
 					a.e.state = stateSynced
+				case isNotFoundTrap(err):
+					// The route was deleted behind our back. This also applies
+					// to a direct synced->replace set: rolling back to oldSyn
+					// would preserve a stale id and make FastHit hide it.
+					a.e.id = 0
+					readd = true
 				case !isTrap(err):
 					a.e.state = stateOffline // transport: retried on next query / sync
 				case a.oldSyn:

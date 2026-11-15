@@ -79,14 +79,15 @@ type RouterOS struct {
 	firstSynced  bool // set after the on_start list/reconciliation has run
 	staticGroups []StaticGroup
 
-	queue      chan func()
-	queueSlots chan struct{}
-	workerWG   sync.WaitGroup
-	opsWG      sync.WaitGroup
-	lifeMu     sync.RWMutex // guards paused/closed and opsWG.Add versus Wait
-	controlMu  sync.Mutex   // serialises Flush and Close
-	paused     bool
-	closed     bool
+	queue            chan func()
+	queueSlots       chan struct{}
+	workerWG         sync.WaitGroup
+	opsWG            sync.WaitGroup
+	lifeMu           sync.RWMutex // guards paused/closed and opsWG.Add versus Wait
+	controlMu        sync.Mutex   // serialises Flush and Close
+	paused           bool
+	closed           bool
+	reconnectPending bool
 
 	warnAAAA rateLimiter
 	warnWait rateLimiter
@@ -127,7 +128,26 @@ func (r *RouterOS) schedule(f func()) bool {
 	return true
 }
 
-func (r *RouterOS) scheduleConnected() { r.schedule(r.onConnected) }
+func (r *RouterOS) scheduleConnected() {
+	r.lifeMu.Lock()
+	if r.closed {
+		r.lifeMu.Unlock()
+		return
+	}
+	if r.paused {
+		// Flush owns the control plane. Collapse any number of reconnects into
+		// one reconciliation that is launched when Flush releases its barrier.
+		r.reconnectPending = true
+		r.lifeMu.Unlock()
+		return
+	}
+	r.opsWG.Add(1)
+	r.lifeMu.Unlock()
+	go func() {
+		defer r.opsWG.Done()
+		r.onConnected()
+	}()
+}
 
 var (
 	_ sequence.Executable            = (*RouterOS)(nil)
@@ -491,11 +511,23 @@ func (r *RouterOS) flush() syncResult {
 	r.opsWG.Wait()
 	res := r.pool.Flush()
 
+	runReconnect := false
 	r.lifeMu.Lock()
 	if !r.closed {
 		r.paused = false
+		if r.reconnectPending {
+			r.reconnectPending = false
+			r.opsWG.Add(1)
+			runReconnect = true
+		}
 	}
 	r.lifeMu.Unlock()
+	if runReconnect {
+		go func() {
+			defer r.opsWG.Done()
+			r.onConnected()
+		}()
+	}
 	return res
 }
 
