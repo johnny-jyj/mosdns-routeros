@@ -14,9 +14,10 @@ the writer sentence lock. PR #32 takes the writer lock first, then returns
 without `EndSentence` if the async loop has ended, permanently leaking that
 lock. The RouterOS plugin uses this `RunArgsContext` path.
 
-`proto/io_context.go` also uses `sync.Once` to close its cancellation channel.
-The upstream non-blocking send can be lost before a read starts, while racing
-`Cancel` with `Close` can send on a channel as it is being closed.
+The reader half of `proto/io_context.go` also uses `sync.Once` to close its
+cancellation channel. The upstream non-blocking send can be lost before a read
+starts, while racing `Cancel` with `Close` can send on a channel as it is being
+closed. The unused writer half remains exactly at PR #32.
 
 No other production source differs from PR #32. In particular, the plugin does
 not use the `Listen*` API, so that path is kept exactly at PR #32 rather than

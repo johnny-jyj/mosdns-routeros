@@ -62,19 +62,18 @@ index 44e5e6d..b0f4246 100644
  		c.mu.Lock()
  		if c.tags != nil {
 diff --git a/proto/io_context.go b/proto/io_context.go
-index 73e1886..c4f21da 100644
+index 73e1886..dc7bf10 100644
 --- a/proto/io_context.go
 +++ b/proto/io_context.go
-@@ -3,7 +3,7 @@ package proto
+@@ -3,6 +3,7 @@ package proto
  import (
  	"bufio"
  	"io"
--	"sync/atomic"
 +	"sync"
+ 	"sync/atomic"
  )
  
- type ctxResult struct {
-@@ -13,27 +13,16 @@ type ctxResult struct {
+@@ -13,27 +14,16 @@ type ctxResult struct {
  
  type ctxReader struct {
  	io.Reader
@@ -106,35 +105,3 @@ index 73e1886..c4f21da 100644
  }
  
  func (c *ctxReader) Read(p []byte) (int, error) {
-@@ -59,27 +48,16 @@ func (c *ctxReader) Read(p []byte) (int, error) {
- 
- type ctxWriter struct {
- 	*bufio.Writer
--	close atomic.Bool
--	done  chan struct{}
-+	done chan struct{}
-+	once sync.Once
- }
- 
- func (c *ctxWriter) Close() {
--	if c.close.Load() {
--		return
--	}
--	c.close.Store(true)
--	close(c.done)
-+	c.once.Do(func() { close(c.done) })
- }
- 
- func (c *ctxWriter) Cancel() {
--	if c.close.Load() {
--		return
--	}
--
--	select {
--	case c.done <- struct{}{}:
--	default:
--	}
-+	c.once.Do(func() { close(c.done) })
- }
- 
- func (c *ctxWriter) Write(p []byte) (int, error) {

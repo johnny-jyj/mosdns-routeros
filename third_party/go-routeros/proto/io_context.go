@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 type ctxResult struct {
@@ -48,16 +49,27 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 
 type ctxWriter struct {
 	*bufio.Writer
-	done chan struct{}
-	once sync.Once
+	close atomic.Bool
+	done  chan struct{}
 }
 
 func (c *ctxWriter) Close() {
-	c.once.Do(func() { close(c.done) })
+	if c.close.Load() {
+		return
+	}
+	c.close.Store(true)
+	close(c.done)
 }
 
 func (c *ctxWriter) Cancel() {
-	c.once.Do(func() { close(c.done) })
+	if c.close.Load() {
+		return
+	}
+
+	select {
+	case c.done <- struct{}{}:
+	default:
+	}
 }
 
 func (c *ctxWriter) Write(p []byte) (int, error) {
