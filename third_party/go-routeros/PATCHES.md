@@ -22,6 +22,9 @@ No other production source differs from PR #32. In particular, the plugin does
 not use the `Listen*` API, so that path is kept exactly at PR #32 rather than
 carrying unrelated local lock changes.
 
+The complete machine-applicable delta and a visual summary are archived in
+`patches/0001-mosdns-run-cancel-lifecycle.patch` and `patches/README.md`.
+
 ## Mandatory upgrade checklist
 
 The root `go.mod` has a local `replace`, so changing its `require` version alone

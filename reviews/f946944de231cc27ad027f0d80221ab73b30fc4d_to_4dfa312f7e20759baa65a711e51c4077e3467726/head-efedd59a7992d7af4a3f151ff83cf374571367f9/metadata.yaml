@@ -29,6 +29,7 @@ dependency_override:
   temporary: true
   require_version_is_build_source: false
   patch_manifest: third_party/go-routeros/PATCHES.md
+  local_patch_file: third_party/go-routeros/patches/0001-mosdns-run-cancel-lifecycle.patch
   production_files_changed_after_pr32:
     - run.go
     - proto/io_context.go

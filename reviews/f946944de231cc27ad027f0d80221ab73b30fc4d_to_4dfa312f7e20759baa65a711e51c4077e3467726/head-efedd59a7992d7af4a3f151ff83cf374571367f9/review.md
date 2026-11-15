@@ -41,6 +41,9 @@
 
 本地生产代码相对 PR #32 只保留两个、且均由当前插件使用的差异：`run.go` 的 writer 锁生命周期修复，以及 `proto/io_context.go` 的 Cancel/Close 一次性关闭修复。`client.go` 和插件未使用的 `Listen*` 路径保持 PR #32 原样；没有修改协议编码、登录、RouterOS sentence、路由命令或响应解析。
 
+PR #32 到当前本地生产代码的完整可应用 diff 已归档为
+`third_party/go-routeros/patches/0001-mosdns-run-cancel-lifecycle.patch`；配套说明见同目录 `README.md`。该 patch 已同时通过“在 PR #32 checkout 正向 apply check”和“在当前源码反向 apply check”。
+
 以后每次检查或升级 go-routeros 都必须：
 
 1. 检查 upstream tag/HEAD 与 PR #32 的状态。

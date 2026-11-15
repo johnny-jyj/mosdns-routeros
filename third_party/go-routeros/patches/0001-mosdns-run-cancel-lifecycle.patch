@@ -1,0 +1,140 @@
+From: mosdns-routeros local patch
+Base: go-routeros PR #32 6e4fd2ed57ae34eac00e041972c4d1b9a832ff2b
+Subject: [PATCH] keep async writer and cancellation lifecycle safe
+
+This is the complete production-code delta carried by mosdns-routeros on top
+of PR #32. It intentionally changes only run.go and proto/io_context.go.
+
+diff --git a/run.go b/run.go
+index 44e5e6d..b0f4246 100644
+--- a/run.go
++++ b/run.go
+@@ -32,12 +32,11 @@ func (c *Client) RunArgs(sentences []string) (*Reply, error) {
+ func (c *Client) RunArgsContext(ctx context.Context, sentences []string) (*Reply, error) {
+ 	c.logger().Debug("RunArgsContext", slog.Any("sentences", sentences))
+ 
+-	c.w.BeginSentence()
+-	for _, sentence := range sentences {
+-		c.w.WriteWord(sentence)
+-	}
+-
+ 	if !c.IsAsync() {
++		c.w.BeginSentence()
++		for _, sentence := range sentences {
++			c.w.WriteWord(sentence)
++		}
+ 		return c.runArgsContextSync()
+ 	}
+ 
+@@ -47,23 +46,26 @@ func (c *Client) RunArgsContext(ctx context.Context, sentences []string) (*Reply
+ 	a := &asyncReply{}
+ 	a.reC = make(chan *proto.Sentence)
+ 	a.tag = fmt.Sprintf("r%d", tag)
+-	c.w.WriteWord(".tag=" + a.tag)
+-	c.logger().Debug("set tag", slog.String("tag", a.tag))
+ 
+-	// Register the tag BEFORE the sentence is sent. If it were registered
+-	// after, a fast reply (sub-millisecond on a LAN) could reach asyncLoop
+-	// while the tag does not exist yet — the reply would be dropped and the
+-	// caller would block forever on a.reC.
++	// Register the tag before sending so an immediate reply cannot be lost.
++	// Never hold mu while acquiring or using the writer: a blocked peer may
++	// keep the writer locked until Close shuts down the connection, and Close
++	// needs mu briefly to publish the closing state.
+ 	c.mu.Lock()
+ 	if c.tags == nil {
+ 		c.mu.Unlock()
+-
+ 		return nil, errAsyncLoopEnded
+ 	}
+-
+ 	c.tags[a.tag] = a
+ 	c.mu.Unlock()
+ 
++	c.w.BeginSentence()
++	for _, sentence := range sentences {
++		c.w.WriteWord(sentence)
++	}
++	c.w.WriteWord(".tag=" + a.tag)
++	c.logger().Debug("set tag", slog.String("tag", a.tag))
++
+ 	if err := c.w.EndSentence(); err != nil {
+ 		c.mu.Lock()
+ 		if c.tags != nil {
+diff --git a/proto/io_context.go b/proto/io_context.go
+index 73e1886..c4f21da 100644
+--- a/proto/io_context.go
++++ b/proto/io_context.go
+@@ -3,7 +3,7 @@ package proto
+ import (
+ 	"bufio"
+ 	"io"
+-	"sync/atomic"
++	"sync"
+ )
+ 
+ type ctxResult struct {
+@@ -13,27 +13,16 @@ type ctxResult struct {
+ 
+ type ctxReader struct {
+ 	io.Reader
+-	close atomic.Bool
+-	done  chan struct{}
++	done chan struct{}
++	once sync.Once
+ }
+ 
+ func (c *ctxReader) Close() {
+-	if c.close.Load() {
+-		return
+-	}
+-	c.close.Store(true)
+-	close(c.done)
++	c.once.Do(func() { close(c.done) })
+ }
+ 
+ func (c *ctxReader) Cancel() {
+-	if c.close.Load() {
+-		return
+-	}
+-
+-	select {
+-	case c.done <- struct{}{}:
+-	default:
+-	}
++	c.once.Do(func() { close(c.done) })
+ }
+ 
+ func (c *ctxReader) Read(p []byte) (int, error) {
+@@ -59,27 +48,16 @@ func (c *ctxReader) Read(p []byte) (int, error) {
+ 
+ type ctxWriter struct {
+ 	*bufio.Writer
+-	close atomic.Bool
+-	done  chan struct{}
++	done chan struct{}
++	once sync.Once
+ }
+ 
+ func (c *ctxWriter) Close() {
+-	if c.close.Load() {
+-		return
+-	}
+-	c.close.Store(true)
+-	close(c.done)
++	c.once.Do(func() { close(c.done) })
+ }
+ 
+ func (c *ctxWriter) Cancel() {
+-	if c.close.Load() {
+-		return
+-	}
+-
+-	select {
+-	case c.done <- struct{}{}:
+-	default:
+-	}
++	c.once.Do(func() { close(c.done) })
+ }
+ 
+ func (c *ctxWriter) Write(p []byte) (int, error) {
