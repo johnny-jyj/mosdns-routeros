@@ -16,6 +16,9 @@
 ## 配置
 
 ```yaml
+api:
+  http: 127.0.0.1:9091           # 管理 API；不是 http_server 插件
+
 plugins:
   - tag: ros
     type: routeros
@@ -30,7 +33,7 @@ plugins:
 
       # --- 路由属性 ---
       gateway: 192.168.88.254      # 默认下一跳；$ros 不带参数时使用；必须是 IPv4 主机地址
-      comment: mosdns              # 归属标记；多套 mosdns 指向同一路由器时请用不同值
+      # comment: mosdns:ros        # 默认由插件 tag 生成；显式配置时必须保证每个管理实例唯一
       # routing_table: main        # 可省略
       # distance: 1                # 可省略
 
@@ -40,6 +43,7 @@ plugins:
       wait: true                   # true：等路由器确认 add 再返回 DNS 应答（超时则直接返回）；false：后台队列异步下发
       on_exit: clean               # clean：退出时删除本插件的全部路由（含 static）；keep：留在路由器上
       on_start: adopt              # adopt：接管路由器上带标记的残留路由；clean：删除非 static 的残留
+      # api_token: "change-me"     # 配置后管理 API 要求 Authorization: Bearer；不配置则只接受 loopback
 
       # --- 静态路由：启动时添加、永不淘汰 ---
       static:
@@ -59,6 +63,8 @@ plugins:
 
 校验规则：`address`、`username`、`gateway` 必填；`static[].gateway` 必填（不继承默认值）；同一 CIDR 在不同 `static` 组里指向不同 gateway 会启动报错。
 
+从旧版本升级且曾省略 `comment` 时，旧路由使用的是 `mosdns`。为避免遗留路由，升级时先显式保留 `comment: mosdns` 完成接管/清理；确认路由器上已无旧标记路由后，再切换到新的按 tag 默认值。
+
 ### 与 cache 配合
 
 - 动态路由不过期，所以 cache 命中跳过 `$ros` 不会造成路由丢失。
@@ -67,15 +73,21 @@ plugins:
 
 ### HTTP 接口
 
-需启用 mosdns 的 `http_server` 插件，路径前缀 `/plugins/<tag>/`：
+接口挂载在核心 `api.http`，不是 `http_server` 插件，路径前缀为 `/plugins/<tag>/`。未配置 `api_token` 时只接受 loopback 客户端。远程访问时核心 API 仍应只监听 loopback，由 HTTPS 反向代理暴露，并同时配置 token 和防火墙来源限制；不要在明文 LAN HTTP 上传输 Bearer token。
 
 | 接口 | 说明 |
 |---|---|
 | `GET /routes` | 池内全部路由（static + dynamic，含状态与 RouterOS `.id`） |
 | `GET /stats` | 池计数、最近一次对账结果、连接状态，以及当场拉取的 `l3hw-settings/monitor` 字段 |
-| `POST /flush` | 删除全部动态路由并对账一次 |
+| `POST /flush` | 删除全部动态路由并对账一次；还必须带 `X-Mosdns-Confirm: flush` |
 
 这些接口没有自动调用者，不访问就不产生任何流量。
+
+```bash
+curl -H 'Authorization: Bearer change-me' http://127.0.0.1:9091/plugins/ros/stats
+curl -X POST -H 'Authorization: Bearer change-me' -H 'X-Mosdns-Confirm: flush' \
+  http://127.0.0.1:9091/plugins/ros/flush
+```
 
 ## RouterOS 侧准备
 

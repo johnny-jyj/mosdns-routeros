@@ -6,6 +6,7 @@ package routeros
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -50,7 +51,7 @@ type Args struct {
 
 	// route attributes
 	Gateway      string `yaml:"gateway"`
-	Comment      string `yaml:"comment"` // default "mosdns"
+	Comment      string `yaml:"comment"` // default "mosdns:<plugin-tag>"
 	RoutingTable string `yaml:"routing_table"`
 	Distance     int    `yaml:"distance"`
 
@@ -60,19 +61,21 @@ type Args struct {
 	Wait      *bool  `yaml:"wait"`       // default true
 	OnExit    string `yaml:"on_exit"`    // clean (default) | keep
 	OnStart   string `yaml:"on_start"`   // adopt (default) | clean
+	APIToken  string `yaml:"api_token"`  // optional bearer token; otherwise API is loopback-only
 
 	Static []StaticGroup `yaml:"static"`
 }
 
 // RouterOS is the plugin instance.
 type RouterOS struct {
-	logger  *zap.Logger
-	cl      *client
-	pool    *pool
-	defGw   uint8
-	wait    bool
-	timeout time.Duration
-	onExit  string
+	logger   *zap.Logger
+	cl       *client
+	pool     *pool
+	defGw    uint8
+	wait     bool
+	timeout  time.Duration
+	onExit   string
+	apiToken string
 
 	startMode    syncMode // on_start policy, used by the first successful sync
 	firstSyncMu  sync.Mutex
@@ -88,6 +91,8 @@ type RouterOS struct {
 	paused           bool
 	closed           bool
 	reconnectPending bool
+	syncRetryTimer   *time.Timer
+	syncRetryDelay   time.Duration
 
 	warnAAAA rateLimiter
 	warnWait rateLimiter
@@ -96,19 +101,60 @@ type RouterOS struct {
 // onConnected runs after every successful API connection. The first time it
 // applies the on_start policy and the one-off L3HW diagnostics; afterwards the
 // pool is the source of truth and unknown routes are removed.
-func (r *RouterOS) onConnected() {
+func (r *RouterOS) onConnected() syncResult {
 	r.firstSyncMu.Lock()
 	if !r.firstSynced {
 		res := r.pool.Sync(r.startMode)
-		if res.Listed {
+		if res.Listed && res.Err == "" {
 			r.firstSynced = true
+			r.resetSyncRetry()
 			r.schedule(func() { r.startupDiag(r.pool.gwAddr(r.defGw), r.staticGroups) })
+		} else {
+			r.scheduleSyncRetry()
 		}
 		r.firstSyncMu.Unlock()
-		return
+		return res
 	}
 	r.firstSyncMu.Unlock()
-	r.pool.Sync(syncClean)
+	res := r.pool.Sync(syncClean)
+	if res.Err != "" {
+		r.scheduleSyncRetry()
+	} else {
+		r.resetSyncRetry()
+	}
+	return res
+}
+
+func (r *RouterOS) scheduleSyncRetry() {
+	r.lifeMu.Lock()
+	defer r.lifeMu.Unlock()
+	if r.closed || r.syncRetryTimer != nil || r.cl == nil || !r.cl.Connected() {
+		return
+	}
+	delay := r.syncRetryDelay
+	if delay == 0 {
+		delay = time.Second
+	}
+	r.syncRetryDelay = min(delay*2, 30*time.Second)
+	r.syncRetryTimer = time.AfterFunc(delay, func() {
+		r.lifeMu.Lock()
+		r.syncRetryTimer = nil
+		closed := r.closed
+		r.lifeMu.Unlock()
+		if !closed && r.cl.Connected() {
+			r.scheduleConnected()
+		}
+	})
+}
+
+func (r *RouterOS) resetSyncRetry() {
+	r.lifeMu.Lock()
+	if r.syncRetryTimer != nil {
+		r.syncRetryTimer.Stop()
+		r.syncRetryTimer = nil
+	}
+	r.syncRetryDelay = 0
+	r.lifeMu.Unlock()
 }
 
 // schedule tracks background control-plane work so Close can establish a
@@ -231,7 +277,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		timeout = d
 	}
 	if a.Comment == "" {
-		a.Comment = "mosdns"
+		a.Comment = "mosdns:" + bp.Tag()
 	}
 	if a.MaxRoutes < 0 {
 		return nil, fmt.Errorf("max_routes must be greater than zero, or zero for the default")
@@ -327,6 +373,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		wait:         wait,
 		timeout:      timeout,
 		onExit:       a.OnExit,
+		apiToken:     a.APIToken,
 		startMode:    startMode,
 		staticGroups: a.Static,
 		queue:        make(chan func(), asyncQueueSize),
@@ -349,7 +396,15 @@ func Init(bp *coremain.BP, args any) (any, error) {
 			cl.reconnectLoop()
 		}()
 	} else {
-		r.onConnected()
+		res := r.onConnected()
+		if res.cause != nil && isTrap(res.cause) {
+			r.resetSyncRetry()
+			// Initialization never claims pre-existing comment-matched routes
+			// strongly enough to delete them on a failed reconciliation.
+			p.Close(false)
+			_ = cl.Close()
+			return nil, fmt.Errorf("routeros initial reconciliation rejected: %w", res.cause)
+		}
 	}
 
 	if !wait {
@@ -446,29 +501,33 @@ func (r *RouterOS) exec(_ context.Context, qCtx *query_context.Context, gw uint8
 		}
 		return nil
 	}
-	acts, removeIDs := r.pool.Learn(ips, gw)
-	if len(acts) == 0 && len(removeIDs) == 0 {
-		r.lifeMu.RUnlock()
-		if slotReserved {
-			<-r.queueSlots
-		}
-		return nil
-	}
-	r.opsWG.Add(1)
 
 	if !r.wait {
+		r.opsWG.Add(1)
 		r.queue <- func() {
 			defer r.opsWG.Done()
 			defer func() { <-r.queueSlots }()
+			acts, removeIDs, active := r.pool.beginLearn(ips, gw)
+			if !active {
+				return
+			}
+			defer r.pool.endLearn()
 			r.pool.Apply(acts, removeIDs)
 		}
 		r.lifeMu.RUnlock()
 		return nil
 	}
 
+	acts, removeIDs, active := r.pool.beginLearn(ips, gw)
+	if !active {
+		r.lifeMu.RUnlock()
+		return nil
+	}
+	r.opsWG.Add(1)
 	done := make(chan struct{})
 	go func() {
 		defer r.opsWG.Done()
+		defer r.pool.endLearn()
 		r.pool.Apply(acts, removeIDs)
 		close(done)
 	}()
@@ -543,6 +602,10 @@ func (r *RouterOS) Close() error {
 	}
 	r.paused = true
 	r.closed = true
+	if r.syncRetryTimer != nil {
+		r.syncRetryTimer.Stop()
+		r.syncRetryTimer = nil
+	}
 	if !r.wait {
 		close(r.queue) // no producer can hold lifeMu.RLock now
 	}
@@ -560,6 +623,7 @@ func (r *RouterOS) Close() error {
 
 func (r *RouterOS) api() *chi.Mux {
 	m := chi.NewRouter()
+	m.Use(r.authorizeAPI)
 	m.Get("/routes", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, r.pool.Routes())
 	})
@@ -578,10 +642,40 @@ func (r *RouterOS) api() *chi.Mux {
 		}
 		writeJSON(w, out)
 	})
-	m.Post("/flush", func(w http.ResponseWriter, _ *http.Request) {
+	m.Post("/flush", func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("X-Mosdns-Confirm") != "flush" {
+			http.Error(w, "missing X-Mosdns-Confirm: flush", http.StatusForbidden)
+			return
+		}
 		writeJSON(w, r.flush())
 	})
 	return m
+}
+
+func (r *RouterOS) authorizeAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if r.apiToken != "" {
+			auth := req.Header.Get("Authorization")
+			parts := strings.Fields(auth)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") ||
+				subtle.ConstantTimeCompare([]byte(parts[1]), []byte(r.apiToken)) != 1 {
+				w.Header().Set("WWW-Authenticate", "Bearer")
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		} else {
+			host, _, err := net.SplitHostPort(req.RemoteAddr)
+			if err != nil {
+				host = req.RemoteAddr
+			}
+			ip, err := netip.ParseAddr(host)
+			if err != nil || !ip.IsLoopback() {
+				http.Error(w, "routeros API is loopback-only unless api_token is configured", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, req)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

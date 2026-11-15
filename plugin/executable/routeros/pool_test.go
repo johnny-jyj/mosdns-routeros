@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	ros "github.com/go-routeros/routeros/v3"
 	"github.com/go-routeros/routeros/v3/proto"
@@ -22,6 +23,9 @@ type fakeBackend struct {
 	removes   int // number of ids removed
 	removeCmd int // number of RemoveRoutes calls
 	addErr    error
+	setErr    error
+	removeErr error
+	listErr   error
 	table     string
 	distance  int
 }
@@ -60,6 +64,9 @@ func (f *fakeBackend) SetRoute(id uint32, gw netip.Addr) error {
 	if !f.connected {
 		return errNotConnected
 	}
+	if f.setErr != nil {
+		return f.setErr
+	}
 	r, ok := f.routes[id]
 	if !ok {
 		return deviceErr("no such item")
@@ -77,6 +84,9 @@ func (f *fakeBackend) RemoveRoutes(ids []uint32) error {
 	if !f.connected {
 		return errNotConnected
 	}
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	f.removeCmd++
 	for _, id := range ids {
 		delete(f.routes, id)
@@ -90,6 +100,9 @@ func (f *fakeBackend) ListRoutes() ([]remoteRoute, error) {
 	defer f.mu.Unlock()
 	if !f.connected {
 		return nil, errNotConnected
+	}
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
 	out := make([]remoteRoute, 0, len(f.routes))
 	for _, r := range f.routes {
@@ -520,6 +533,34 @@ func TestRetrySetOnDeletedRouteReadds(t *testing.T) {
 	}
 }
 
+func TestRetrySetOtherTrapKeepsStaleID(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	learn(p, a, "1.1.1.1")
+	route, _ := f.find("1.1.1.1/32")
+
+	p.mu.Lock()
+	p.dyn[0x01010101].state = stateOffline
+	p.mu.Unlock()
+	f.setErr = deviceErr("not enough permissions")
+
+	learn(p, a, "1.1.1.1")
+	p.mu.RLock()
+	e := p.dyn[0x01010101]
+	gotID, gotState := e.id, e.state
+	p.mu.RUnlock()
+	if gotID != route.id || gotState != stateOffline || f.adds != 1 || f.count() != 1 {
+		t.Fatalf("id=%d state=%d adds=%d count=%d", gotID, gotState, f.adds, f.count())
+	}
+
+	f.setErr = nil
+	learn(p, a, "1.1.1.1")
+	if st := p.Stats(); st.Synced != 1 || f.adds != 1 || f.count() != 1 {
+		t.Fatalf("retry did not recover with set: stats=%+v adds=%d count=%d", st, f.adds, f.count())
+	}
+}
+
 func TestReplaceSetOnDeletedRouteReadds(t *testing.T) {
 	f := newFake()
 	p, a, b := newTestPool(t, f, 100, true)
@@ -700,6 +741,101 @@ func TestSyncAdoptRepairsDistance(t *testing.T) {
 	r, _ := f.find("1.1.1.1/32")
 	if r.distance != 5 {
 		t.Fatalf("distance=%d, want 5", r.distance)
+	}
+}
+
+type deleteBeforeSetBackend struct {
+	*fakeBackend
+}
+
+func (b *deleteBeforeSetBackend) SetRoute(id uint32, _ netip.Addr) error {
+	b.mu.Lock()
+	delete(b.routes, id)
+	b.mu.Unlock()
+	return deviceErr("no such item")
+}
+
+func TestSyncStaticSetNotFoundReadds(t *testing.T) {
+	be := &deleteBeforeSetBackend{fakeBackend: newFake()}
+	p, _, _ := newTestPool(t, be, 100, false)
+	prefix := netip.MustParsePrefix("10.0.0.0/8")
+	if err := p.addStatic(prefix, gwA); err != nil {
+		t.Fatal(err)
+	}
+	p.finishStatic()
+	be.inject(prefix.String(), gwB.String())
+
+	res := p.Sync(syncClean)
+	route, ok := be.find(prefix.String())
+	if res.Err != "" || res.Added != 1 || !ok || route.gw != gwA || be.count() != 1 {
+		t.Fatalf("res=%+v route=%+v ok=%v count=%d", res, route, ok, be.count())
+	}
+	p.mu.RLock()
+	synced := p.static[0].synced
+	id := p.static[0].id
+	p.mu.RUnlock()
+	if !synced || id != route.id {
+		t.Fatalf("static state synced=%v id=%d route=%d", synced, id, route.id)
+	}
+}
+
+type blockingListBackend struct {
+	*fakeBackend
+	listed  chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingListBackend) ListRoutes() ([]remoteRoute, error) {
+	routes, err := b.fakeBackend.ListRoutes()
+	close(b.listed)
+	<-b.release
+	return routes, err
+}
+
+func TestSyncDoesNotCrossLearnApplyTransaction(t *testing.T) {
+	be := &blockingListBackend{
+		fakeBackend: newFake(),
+		listed:      make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	p, a, _ := newTestPool(t, be, 100, false)
+	p.finishStatic()
+
+	synced := make(chan syncResult, 1)
+	go func() { synced <- p.Sync(syncClean) }()
+	<-be.listed
+
+	applied := make(chan struct{})
+	go func() {
+		acts, ids, active := p.beginLearn([]netip.Addr{netip.MustParseAddr("1.1.1.1")}, a)
+		if active {
+			p.Apply(acts, ids)
+			p.endLearn()
+		}
+		close(applied)
+	}()
+	select {
+	case <-applied:
+		t.Fatal("Learn+Apply crossed an in-progress reconciliation snapshot")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(be.release)
+	select {
+	case res := <-synced:
+		if res.Err != "" {
+			t.Fatalf("sync failed: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sync did not finish")
+	}
+	select {
+	case <-applied:
+	case <-time.After(time.Second):
+		t.Fatal("Learn+Apply did not resume after sync")
+	}
+	if be.count() != 1 || be.adds != 1 {
+		t.Fatalf("router count=%d adds=%d, want one tracked route", be.count(), be.adds)
 	}
 }
 

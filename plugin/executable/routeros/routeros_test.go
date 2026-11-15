@@ -2,6 +2,8 @@ package routeros
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -136,6 +138,25 @@ func TestOnConnectedRetriesInitialAdoptAfterListFailure(t *testing.T) {
 	}
 }
 
+func TestOnConnectedDoesNotCompleteAfterRepairTrap(t *testing.T) {
+	f := newFake()
+	f.addErr = deviceErr("not enough permissions")
+	p, _, _ := newTestPool(t, f, 100, false)
+	if err := p.addStatic(netip.MustParsePrefix("10.0.0.0/8"), gwA); err != nil {
+		t.Fatal(err)
+	}
+	p.finishStatic()
+	r := &RouterOS{logger: zap.NewNop(), pool: p, startMode: syncAdopt, paused: true}
+
+	res := r.onConnected()
+	if res.Err == "" || !isTrap(res.cause) {
+		t.Fatalf("sync result did not retain trap: %+v cause=%v", res, res.cause)
+	}
+	if r.firstSynced {
+		t.Fatal("failed repair was marked as the completed initial sync")
+	}
+}
+
 // #7: Exec in async mode must not panic when racing with Close.
 func TestAsyncExecAfterClose(t *testing.T) {
 	f := newFake()
@@ -228,6 +249,36 @@ func TestExecExtractsARecords(t *testing.T) {
 	// nil response is a no-op
 	if err := r.Exec(context.Background(), query_context.NewContext(q)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAsyncQueuedWorkDoesNotHoldReconcileBarrier(t *testing.T) {
+	f := newFake()
+	p, a, _ := newTestPool(t, f, 100, false)
+	p.finishStatic()
+	r := &RouterOS{
+		logger: zap.NewNop(), pool: p, defGw: a, wait: false,
+		queue: make(chan func(), 1), queueSlots: make(chan struct{}, 1),
+	}
+	if err := r.Exec(context.Background(), queryWithA(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan syncResult, 1)
+	go func() { done <- p.Sync(syncClean) }()
+	select {
+	case res := <-done:
+		if res.Err != "" {
+			t.Fatalf("sync failed: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued async work held the reconciliation barrier before execution")
+	}
+
+	(<-r.queue)()
+	r.opsWG.Wait()
+	if f.count() != 1 {
+		t.Fatalf("queued update produced %d routes", f.count())
 	}
 }
 
@@ -404,4 +455,68 @@ func queryWithA(ip byte) *query_context.Context {
 	qc := query_context.NewContext(q)
 	qc.SetResponse(resp)
 	return qc
+}
+
+func TestRouterOSAPIAuthorization(t *testing.T) {
+	newRouter := func(token string) *RouterOS {
+		f := newFake()
+		p, _, _ := newTestPool(t, f, 100, false)
+		p.finishStatic()
+		return &RouterOS{
+			logger:   zap.NewNop(),
+			cl:       newClient(clientConfig{}, zap.NewNop()),
+			pool:     p,
+			wait:     true,
+			apiToken: token,
+		}
+	}
+	request := func(r *RouterOS, method, path, remote, token, confirm string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = remote
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if confirm != "" {
+			req.Header.Set("X-Mosdns-Confirm", confirm)
+		}
+		rr := httptest.NewRecorder()
+		r.api().ServeHTTP(rr, req)
+		return rr
+	}
+	requestAuth := func(r *RouterOS, auth string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/routes", nil)
+		req.RemoteAddr = "192.0.2.10:1234"
+		req.Header.Set("Authorization", auth)
+		rr := httptest.NewRecorder()
+		r.api().ServeHTTP(rr, req)
+		return rr
+	}
+
+	r := newRouter("")
+	if rr := request(r, http.MethodGet, "/routes", "192.0.2.10:1234", "", ""); rr.Code != http.StatusForbidden {
+		t.Fatalf("remote request without token status=%d", rr.Code)
+	}
+	if rr := request(r, http.MethodGet, "/routes", "127.0.0.1:1234", "", ""); rr.Code != http.StatusOK {
+		t.Fatalf("loopback request status=%d", rr.Code)
+	}
+	if rr := request(r, http.MethodPost, "/flush", "127.0.0.1:1234", "", ""); rr.Code != http.StatusForbidden {
+		t.Fatalf("unconfirmed flush status=%d", rr.Code)
+	}
+	if rr := request(r, http.MethodPost, "/flush", "127.0.0.1:1234", "", "flush"); rr.Code != http.StatusOK {
+		t.Fatalf("confirmed flush status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	r = newRouter("secret")
+	if rr := request(r, http.MethodGet, "/routes", "192.0.2.10:1234", "", ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("missing bearer status=%d", rr.Code)
+	}
+	if rr := request(r, http.MethodGet, "/routes", "192.0.2.10:1234", "wrong", ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer status=%d", rr.Code)
+	}
+	if rr := request(r, http.MethodGet, "/routes", "192.0.2.10:1234", "secret", ""); rr.Code != http.StatusOK {
+		t.Fatalf("valid bearer status=%d", rr.Code)
+	}
+	if rr := requestAuth(r, "bearer   secret"); rr.Code != http.StatusOK {
+		t.Fatalf("case-insensitive bearer status=%d", rr.Code)
+	}
 }
